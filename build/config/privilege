@@ -1,0 +1,9 @@
+{
+    "defaults":
+    {
+        "run-as": "package"
+    },
+    "username": "mail-archiver-fnos",
+    "groupname": "mail-archiver-fnos",
+    "join-groups": ["docker", "Users"]
+}
