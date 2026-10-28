@@ -1,0 +1,113 @@
+[
+  {
+    "stepTitle": "管理员账号",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "这是 Mail-archiver 自己的管理员账号（不是 fnOS 账号）。它用于：① 首次打开应用时完成 fnOS 用户与归档账号的绑定；② 后端维护。安装时填一次，之后可在「应用设置」里改密码。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_admin_username",
+        "label": "管理员用户名",
+        "initValue": "admin",
+        "rules": [
+          {
+            "required": true,
+            "message": "请填写管理员用户名"
+          },
+          {
+            "pattern": "^[A-Za-z0-9._-]{3,64}$",
+            "message": "3–64 个字符，只能包含字母、数字、点、下划线、连字符"
+          }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "该密码**仅用于创建全新的数据库**（首次安装）。若检测到已有数据（例如上次卸载选了「保留数据」），**此密码不会改变已有账号的密码**——届时请使用原有密码，或在设置页/命令行用 --reset-password 重置。密码只存哈希、无法查看，只能重置。首次登录会要求修改密码（属正常）。"
+      },
+      {
+        "type": "password",
+        "field": "wizard_admin_password",
+        "label": "管理员密码（仅首次建库时生效）",
+        "initValue": "",
+        "rules": [
+          {
+            "required": true,
+            "message": "请填写管理员密码"
+          },
+          {
+            "pattern": "^.{8,128}$",
+            "message": "至少 8 个字符"
+          }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "密码只写入应用配置目录（权限 600），不会出现在容器命令行或 compose 文件里。"
+      }
+    ]
+  },
+  {
+    "stepTitle": "数据存放位置",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "默认把邮件原文、附件和数据库放在应用自有目录（/volN/@appdata/mail-archiver-fnos/data），随应用卸载走、空间通常较小。\n\n想放到你自己的存储空间（推荐，便于备份和扩容），请分两步：\n1) 先到「应用设置 → 访问权限」把目标目录授权给本应用；\n2) 安装完成后到「应用设置 → 数据目录」选「改到指定目录」并填同一个路径。\n顺序反了会报「数据目录不可写」。"
+      },
+      {
+        "type": "select",
+        "field": "wizard_data_mode",
+        "label": "数据目录",
+        "initValue": "keep",
+        "options": [
+          {
+            "label": "使用应用自有目录（推荐先这样，装好再改）",
+            "value": "keep"
+          },
+          {
+            "label": "现在就指定存储空间目录（需已授权）",
+            "value": "custom"
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_data_dir",
+        "label": "存储空间目录（仅上面选「现在就指定」时填写）",
+        "initValue": "",
+        "rules": [
+          {
+            "pattern": "^$|^/vol[0-9]+(/[A-Za-z0-9._一-龥-]+)+$",
+            "message": "请填完整绝对路径，以 /volN/ 开头，例如 /vol1/1000/MailArchive"
+          }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "改数据目录只改变「以后数据写到哪里」，不会自动搬动已有数据。切换后旧目录里的数据仍在原地。"
+      }
+    ]
+  },
+  {
+    "stepTitle": "时区",
+    "items": [
+      {
+        "type": "text",
+        "field": "wizard_timezone",
+        "label": "显示时区（IANA 名称）",
+        "initValue": "Asia/Shanghai",
+        "rules": [
+          {
+            "required": true,
+            "message": "请填写时区"
+          },
+          {
+            "pattern": "^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+)*$",
+            "message": "例如 Asia/Shanghai 或 UTC"
+          }
+        ]
+      }
+    ]
+  }
+]
