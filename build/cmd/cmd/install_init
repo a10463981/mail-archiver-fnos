@@ -1,0 +1,163 @@
+#!/bin/bash
+# 安装前：只读校验，任何一项硬失败都 exit 1（错误写 TRIM_TEMP_LOGFILE 让应用中心显示）
+set -u
+
+APP_NAME=mail-archiver-fnos
+VAR_DIR="${TRIM_PKGVAR:-}"
+CFG_DIR="${TRIM_PKGETC:-}"
+LOG_FILE="${TRIM_TEMP_LOGFILE:-${TRIM_PKGVAR:-/tmp}/lifecycle.log}"
+
+say() { echo "[${APP_NAME}] $*"; }
+fail() { echo "[${APP_NAME}] ERROR: $*" >>"${LOG_FILE}" 2>/dev/null || true; echo "[${APP_NAME}] ERROR: $*" >&2; exit 1; }
+warn() { echo "[${APP_NAME}] WARN: $*" >>"${LOG_FILE}" 2>/dev/null || true; echo "[${APP_NAME}] WARN: $*" >&2; }
+
+say "install_init begin"
+
+# ---------------------------------------------------------------- 残留自愈（"存在安装历史"）
+# 平台在安装前会检查本应用的残留（半成品目录/临时目录）。若命中，界面上只显示
+# "存在安装历史"，用户不知道删什么，只能手工猜。这里**只针对本应用**做两件事：
+#   1) 能安全清的就清（平台临时目录 ${TRIM_APPTEMP}/<app> 里的内容）；
+#   2) 不能安全清的（数据/配置/运行目录）**不删**，但把确切路径打出来，让用户知道删什么。
+# 白名单：只允许在 ${TRIM_APPTEMP} 之下操作；其它路径一律只打印不删除。
+clean_app_residue() {
+    local app="$1" tmp="${TRIM_APPTEMP:-}" cleaned=0 blocked=""
+
+    if [ -n "${tmp}" ] && [ -d "${tmp}/${app}" ]; then
+        if [ -n "$(ls -A "${tmp}/${app}" 2>/dev/null)" ]; then
+            say "检测到平台临时目录残留：${tmp}/${app}（内容 $(ls -A "${tmp}/${app}" 2>/dev/null | tr '\n' ' ')），正在清理…"
+            if find "${tmp}/${app}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null; then
+                say "已清理 ${tmp}/${app} 下的残留内容（目录本身保留，交给平台）"
+                cleaned=1
+            else
+                blocked="${blocked}\n  ${tmp}/${app}（清理失败，需要 root 删除）"
+            fi
+        fi
+    fi
+
+    # 以下目录**不删**（属数据/配置/运行产物），只在存在时给出可执行指引
+    local d
+    for d in "${TRIM_PKGVAR:-}/data" "${TRIM_PKGETC:-}" "${TRIM_APPDEST:-}"; do
+        [ -n "${d}" ] || continue
+        case "${d}" in
+            "${TRIM_PKGVAR:-}/data")
+                # 空目录不算残留；有 pgdata/mail 才算"有数据"，那是用户的，不能删
+                if [ -e "${d}/pgdata" ] || [ -e "${d}/mail" ]; then
+                    say "提示：${d} 下已有数据（pgdata/mail），**不会被删除**；安装将沿用这份数据。"
+                fi
+                ;;
+        esac
+    done
+
+    if [ -n "${blocked}" ]; then
+        fail "存在无法自动清理的本应用残留，请手工删除后重试：${blocked}
+
+（这些目录不属于任何其它应用或系统路径，删除是安全的；本脚本不会替你删数据。）"
+    fi
+
+    [ "${cleaned}" = "1" ] && say "残留自愈完成：已清理本应用在平台临时目录下的残留。" \
+        || say "残留自愈检查完成：未发现需要清理的本应用临时残留。"
+}
+
+clean_app_residue "${APP_NAME}"
+
+
+
+# 1) 运行身份：compose 用 ${TRIM_UID}:${TRIM_GID} 指定容器用户，缺了数据目录必然写不进去
+[ -n "${TRIM_UID:-}" ] || fail "安装环境未提供 TRIM_UID，无法确定容器运行用户，已中止。"
+[ -n "${TRIM_GID:-}" ] || fail "安装环境未提供 TRIM_GID，无法确定容器运行用户，已中止。"
+[ -n "${VAR_DIR}" ]    || fail "安装环境未提供 TRIM_PKGVAR，已中止。"
+[ -n "${CFG_DIR}" ]    || fail "安装环境未提供 TRIM_PKGETC，已中止。"
+
+# 2) 架构：首版只发 x86
+arch="$(uname -m)"
+case "${arch}" in
+    x86_64 | amd64) ;;
+    *) fail "本包仅支持 x86_64 设备（当前 ${arch}）。" ;;
+esac
+
+# 3) Docker / Compose（降级为告警：安装期 daemon 可能还没起）
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    say "docker ok: $(docker --version 2>/dev/null | head -1)"
+else
+    warn "Docker 不可用（未安装或 daemon 未运行），安装继续但应用无法启动。排查：systemctl status docker；ls -l /var/run/docker.sock"
+fi
+if command -v docker >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
+    warn "docker compose v2 不可用，应用由应用中心托管启动，缺少它会导致启动失败。"
+fi
+
+# 3b) 镜像预载（关键：必须发生在平台 init-docker 之前）
+# 平台的安装流程是 install_init → 解包 → init-docker( compose up ) → install_callback。
+# 本地构建的私镜像（mail-archiver-fnos:zh-*）不在任何公共 registry 上，
+# 若等到 init-docker 才准备，compose 会尝试 pull 并失败（实测：event=APP_INSTALL_FAILED_INIT_DOCKER_EXCEPTION）。
+# 因此在这里从"包解压目录"里把 images/*.tar 先 load 进本地 docker。
+APP_NAME=mail-archiver-fnos
+IMAGE_REF_DEFAULT="mail-archiver-fnos:zh-39f59d2"
+
+preload_image() {
+    tarball=""
+    for d in "${TRIM_TEMP_TPKFILE:-}" "${TRIM_PKGINST_TEMP_DIR:-}" \
+             "/vol1/appcenter-downloads/${APP_NAME}-${TRIM_APPVER:-}-tpk"; do
+        [ -n "${d}" ] && [ -d "${d}" ] || continue
+        say "探测包目录：${d}"
+        found="$(tar tzf "${d}/app.tgz" 2>/dev/null | grep -m1 '^images/.*\.tar$' || true)"
+        if [ -n "${found}" ]; then
+            tarball="${d}/app.tgz:${found}"
+            break
+        fi
+    done
+    [ -n "${tarball}" ] || { say "包内未发现镜像 tar（走在线拉取）"; return 0; }
+
+    pkg="${tarball%%:*}"; mem="${tarball#*:}"
+    say "包内镜像：${mem}（来自 ${pkg}）"
+    tmpd="$(mktemp -d 2>/dev/null || echo /tmp/mapreload)"
+    mkdir -p "${tmpd}" && tar xzf "${pkg}" -C "${tmpd}" "${mem}" 2>/dev/null || true
+    if [ -f "${tmpd}/${mem}" ]; then
+        docker load -i "${tmpd}/${mem}" >/dev/null 2>&1 \
+            && say "镜像预载完成：$(basename "${mem}")" \
+            || warn "docker load 失败（${mem}），稍后由 install_callback 重试/在线拉取"
+        rm -rf "${tmpd}"
+    else
+        warn "解出镜像 tar 失败（${mem}）"
+        rm -rf "${tmpd}"
+    fi
+}
+
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    if docker image inspect "${IMAGE_REF_DEFAULT}" >/dev/null 2>&1; then
+        say "镜像已在本机：${IMAGE_REF_DEFAULT}（跳过预载）"
+    else
+        preload_image || true
+    fi
+fi
+
+# 4) 内存：3GB 以下给告警（.NET 应用 + PostgreSQL 同机）
+mem_kb="$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null)"
+if [ -n "${mem_kb}" ] && [ "${mem_kb}" -lt 3145728 ]; then
+    warn "物理内存不足 3GB（$(awk -v k="${mem_kb}" 'BEGIN{printf "%.1f", k/1048576}')GB）。本应用为 .NET（无 JVM），与 PostgreSQL 同机运行，建议 ≥4GB；内存不足可通过容器内存限制调节。"
+fi
+
+# 5) 空间：镜像解压 + 数据库起步约 1.5GB
+space_probe=""
+for p in "${TRIM_APPDEST_VOL:-}" "/vol1" "$(dirname "${VAR_DIR}")" "/"; do
+    [ -n "${p}" ] && [ -d "${p}" ] && { space_probe="${p}"; break; }
+done
+avail_kb="$(df -Pk "${space_probe:-/}" 2>/dev/null | awk 'NR==2{print $4}')"
+if [ -n "${avail_kb}" ] && [ "${avail_kb}" -lt 2097152 ]; then
+    warn "可用空间不足 2GB（${space_probe:-/} 剩 $(awk -v k="${avail_kb}" 'BEGIN{printf "%.1f", k/1048576}')GB），数据库可能起不来。"
+fi
+
+# 6) 本应用不发布任何 TCP 端口，故不做端口占用检查（这是设计约束，不是遗漏）
+say "本应用不监听任何 TCP 端口，仅通过 ${TRIM_APPDEST:-<app dir>}/app.sock 暴露给 fnOS 统一网关。"
+
+# 7) 数据目录（可选自定义）：只提示，不阻断——真正的判定与回落放在 install_callback
+data_pref="${wizard_data_dir:-}"
+if [ -n "${data_pref}" ]; then
+    if [ -d "${data_pref}" ] && [ -w "${data_pref}" ]; then
+        say "自定义数据目录可写：${data_pref}"
+    else
+        warn "自定义数据目录 ${data_pref} 当前不可写。若它位于存储空间，请先在「应用设置 → 访问权限」里把该目录授权给本应用，否则 install_callback 会回落到应用自有目录。"
+    fi
+fi
+
+say "install_init ok"
+exit 0
