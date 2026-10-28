@@ -1,0 +1,64 @@
+#!/bin/bash
+# 卸载后：停容器（严禁 -v，数据是 bind mount）；按向导选择 keep/delete 处理数据根。
+# 注意：${CFG_DIR} 里的 app.env / pg_password **必须保留**——删了密码，重装后新密码与旧 pgdata 不匹配，
+#       "保留数据重装"会直接失败。这是与 rustfs（删 S3 凭据）不同的地方。
+set -u
+
+APP_NAME=mail-archiver-fnos
+APPDEST="${TRIM_APPDEST}"
+CFG_DIR="${TRIM_PKGETC}"
+VAR_DIR="${TRIM_PKGVAR}"
+LOG_FILE="${TRIM_TEMP_LOGFILE:-${TRIM_PKGVAR:-/tmp}/lifecycle.log}"
+
+say() { echo "[${APP_NAME}] $*"; }
+warn() { echo "[${APP_NAME}] WARN: $*" >>"${LOG_FILE}" 2>/dev/null || true; echo "[${APP_NAME}] WARN: $*" >&2; }
+fail_uninstall() { echo "[${APP_NAME}] ERROR: $*" >&2; exit 1; }
+trace() { { mkdir -p "${VAR_DIR}" && echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"${VAR_DIR}/lifecycle.log"; } 2>/dev/null || true; }
+
+action="${wizard_data_action:-${data_action:-keep}}"
+trace "uninstall_callback begin action=${action}"
+
+# 1) 停容器：**绝不带 -v**
+if [ -f "${APPDEST}/docker/docker-compose.yaml" ] && docker compose version >/dev/null 2>&1; then
+    docker compose -p "${APP_NAME}" -f "${APPDEST}/docker/docker-compose.yaml" down --remove-orphans >/dev/null 2>&1 \
+        || say "警告：compose down 失败（可忽略，继续清理）。"
+else
+    docker rm -f "${APP_NAME}" "${APP_NAME}-db" >/dev/null 2>&1 || true
+fi
+
+# 2) 数据处理
+data_root="${VAR_DIR}/data"
+real_target="$(readlink "${data_root}" 2>/dev/null || echo "")"
+
+say "数据根：${data_root}${real_target:+ -> ${real_target}}"
+# 记录本次卸载动作，供 install_callback 判断"用户刚选过删除数据"（见安装侧的 fail 分支）
+printf '%s\n' "${action}" >"${CFG_DIR}/last_uninstall_action" 2>/dev/null || true
+
+if [ "${action}" = "delete" ]; then
+    # P0 修复：旧实现只删符号链接、明确"不删除存储空间里的数据" ⇒ 选"删除数据"后旧库仍在，
+    # 重装挂回旧库、旧 admin 哈希存活、向导新密码必然无效。现在改为**真正删除目标目录**。
+    . "$(dirname "$0")/lib/data-purge.sh" 2>/dev/null || . "${APPDEST}/cmd/lib/data-purge.sh" 2>/dev/null \
+        || fail_uninstall "缺少 lib/data-purge.sh（fpk 打包不完整）"
+    if ! purge_standard_data_root "${data_root}" "${LOG_FILE}"; then
+        warn "标准数据目录未能删除（原因见上）。**重装后会沿用旧数据库与旧账号密码**；如需干净重装，请人工处理后再试。"
+        trace "uninstall_callback: purge refused/failed"
+        exit 1
+    fi
+    rm -rf "${VAR_DIR}/logs" 2>/dev/null || true
+    say "已删除日志目录 ${VAR_DIR}/logs"
+    if [ -L "${data_root}" ]; then
+        say "已删除应用的标准数据目录与符号链接；**你在存储空间自定义的数据目录保持不动**（应用不管理它）。"
+    else
+        say "已按你的选择**删除应用自有数据目录**（数据库与邮件附件已清除）。重装将得到全新空库与全新账号。"
+    fi
+else
+    say "已保留数据（重装后可继续使用）：$(readlink -f "${data_root}" 2>/dev/null || echo "${data_root}")"
+    say "提示：下次重装会沿用原有账号与密码，**向导里填的管理员密码不会生效**。"
+fi
+
+# 3) 配置与密钥：保留（见文件头说明），只清理运行时缓存
+rm -rf "${VAR_DIR}/DataProtection-Keys" 2>/dev/null || true
+say "已清理运行时密钥缓存 ${VAR_DIR}/DataProtection-Keys（配置与数据库密码保留）"
+
+trace "uninstall_callback ok"
+exit 0
