@@ -1,0 +1,3 @@
+# fpk 二进制不进仓库文件树（走 Releases）
+*.fpk
+out/

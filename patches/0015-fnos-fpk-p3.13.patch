@@ -1,0 +1,3408 @@
+diff --git a/Auth/Extensions/AddAuthExtension.cs b/Auth/Extensions/AddAuthExtension.cs
+index f887407..11a6693 100644
+--- a/Auth/Extensions/AddAuthExtension.cs
++++ b/Auth/Extensions/AddAuthExtension.cs
+@@ -25,6 +25,27 @@ namespace MailArchiver.Auth.Extensions
+             };
+         }
+ 
++        /// <summary>
++        /// Same normalisation as the middleware pipeline: leading slash, no trailing slash,
++        /// empty means "root".
++        /// </summary>
++        internal static string NormalizePathBase(string? value)
++        {
++            if (string.IsNullOrWhiteSpace(value))
++            {
++                return "/";
++            }
++
++            var path = value.Trim();
++            if (!path.StartsWith('/'))
++            {
++                path = "/" + path;
++            }
++
++            path = path.TrimEnd('/');
++            return path.Length == 0 ? "/" : path;
++        }
++
+         public static WebApplicationBuilder AddAuth(this WebApplicationBuilder builder)
+         {
+             builder.Services.AddScoped<AuthenticationHandler>();
+@@ -33,6 +54,28 @@ namespace MailArchiver.Auth.Extensions
+             // Get authentication options for SameSite configuration
+             var authOptionsConfig = builder.Configuration.GetSection(AuthenticationOptions.Authentication).Get<AuthenticationOptions>() ?? new AuthenticationOptions();
+             var cookieSameSiteMode = ParseSameSiteMode(authOptionsConfig.CookieSameSite);
++
++            // Scope the authentication cookie to the application's path base.
++            //
++            // CookieAuthenticationOptions.Cookie.Path is left unset upstream, and the cookie handler
++            // then emits "path=/" — measured on a live instance: with PathBase=/app/mail-archiver-fnos
++            // the auth cookie came out as "path=/" while the antiforgery cookie correctly came out as
++            // "path=/app/mail-archiver-fnos". A "/" cookie is shared with everything else served from
++            // the same origin (the NAS UI itself, and any earlier installation of this app), so a
++            // stale cookie with the same name from a previous image shadows the new one and the
++            // session can never be established. Scoping to the path base makes each installation's
++            // cookie unambiguous.
++            var pathBaseForCookie = builder.Configuration["PathBase"];
++            if (string.IsNullOrWhiteSpace(pathBaseForCookie))
++            {
++                pathBaseForCookie = Environment.GetEnvironmentVariable("PATH_BASE");
++            }
++
++            // Explicit configuration wins (Authentication:CookiePath); otherwise the path base is
++            // used, which degrades to "/" for an unmounted deployment exactly like upstream.
++            pathBaseForCookie = string.IsNullOrWhiteSpace(authOptionsConfig.CookiePath)
++                ? NormalizePathBase(pathBaseForCookie)
++                : NormalizePathBase(authOptionsConfig.CookiePath);
+             
+             var authBuilder = builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme);
+             authBuilder.AddCookie(CookieAuthenticationDefaults.AuthenticationScheme, options =>
+@@ -41,6 +84,7 @@ namespace MailArchiver.Auth.Extensions
+                 options.LogoutPath = "/Auth/Logout";
+                 options.AccessDeniedPath = "/Auth/AccessDenied";
+                 options.Cookie.Name = authOptionsConfig.CookieName;
++                options.Cookie.Path = pathBaseForCookie;
+                 options.Cookie.HttpOnly = true;
+                 options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+                 options.Cookie.SameSite = cookieSameSiteMode;
+@@ -60,6 +104,7 @@ namespace MailArchiver.Auth.Extensions
+             {
+                 authBuilder.AddCookie(OAuthOptions.SignInScheme, options =>
+                 {
++                    options.Cookie.Path = pathBaseForCookie;
+                     options.Cookie.HttpOnly = true;
+                     options.Cookie.SameSite = cookieSameSiteMode;
+                     options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+@@ -224,12 +269,12 @@ namespace MailArchiver.Auth.Extensions
+                             
+                             if (ex.Message == pendingApprovalMsg || ex.Message == deactivatedMsg)
+                             {
+-                                ctx.Response.Redirect($"/Auth/Blocked?message={Uri.EscapeDataString(ex.Message)}");
++                                ctx.Response.Redirect($"{ctx.Request.PathBase}/Auth/Blocked?message={Uri.EscapeDataString(ex.Message)}");
+                             }
+                             else
+                             {
+                                 // Other errors (e.g., email already exists) go to login page
+-                                ctx.Response.Redirect($"/Auth/Login?error={Uri.EscapeDataString(ex.Message)}");
++                                ctx.Response.Redirect($"{ctx.Request.PathBase}/Auth/Login?error={Uri.EscapeDataString(ex.Message)}");
+                             }
+                         }
+                     };
+diff --git a/Auth/Extensions/UseAuthExtension.cs b/Auth/Extensions/UseAuthExtension.cs
+index 15756b4..e4d5fa8 100644
+--- a/Auth/Extensions/UseAuthExtension.cs
++++ b/Auth/Extensions/UseAuthExtension.cs
+@@ -6,6 +6,11 @@ namespace MailArchiver.Auth.Extensions
+     {
+         public static WebApplication UseAuth(this WebApplication app)
+         {
++            // fnOS gateway identity bridge. MUST run BEFORE the native gate below: that gate
++            // 302s every unauthenticated request to /Auth/Login, so the bridge has to be able to
++            // sign the user in first. When Gateway:Enabled is false this is a pass-through.
++            app.UseMiddleware<GatewayAuthMiddleware>();
++
+             // Add our custom authentication middleware
+             app.UseMiddleware<AuthenticationMiddleware>();
+             app.UseAuthorization();
+diff --git a/Auth/Middelwares/AuthenticationMiddleware.cs b/Auth/Middelwares/AuthenticationMiddleware.cs
+index 63304bf..062a235 100644
+--- a/Auth/Middelwares/AuthenticationMiddleware.cs
++++ b/Auth/Middelwares/AuthenticationMiddleware.cs
+@@ -20,6 +20,8 @@ namespace MailArchiver.Auth.Middlewares
+         }
+ 
+         public async Task InvokeAsync(HttpContext context, MailArchiver.Services.IAuthenticationService authService,
++            IUserService userService,
++            IOptions<MailArchiver.Models.AuthenticationOptions> authOptions,
+             IOptions<ApiOptions> apiOptions, IOptions<McpOptions> mcpOptions)
+         {
+             var path = context.Request.Path.Value?.ToLower() ?? string.Empty;
+@@ -44,21 +46,39 @@ namespace MailArchiver.Auth.Middlewares
+             }
+ 
+             // Skip authentication for certain paths
+-            var skipPaths = new[] { "/auth/login", "/auth/logout", "/auth/blocked", "/oidc-signin-completed", "/twofactor/", "/css/", "/js/", "/images/", "/favicon" };
++            // /auth/gatewaycontinue is the passwordless way back in after a sign-out; it must be reachable
++            // WITHOUT a session, otherwise the login page's "continue as <fnOS user>" button would be
++            // redirected to the login page — the very dead end it exists to remove.
++            var skipPaths = new[] { "/auth/login", "/auth/logout", "/auth/blocked", "/auth/gatewaycontinue", "/auth/consent", "/oidc-signin-completed", "/twofactor/", "/css/", "/js/", "/images/", "/favicon" };
+ 
+             var shouldSkip = skipPaths.Any(skipPath => path.StartsWith(skipPath));
+ 
+             if (!shouldSkip)
+             {
+-                // Check if user is authenticated through framework
++                // DO NOT "fix" this unused result by assigning it to context.User.
++                //
++                // context.User is already populated at this point by the framework's implicitly
++                // registered UseAuthentication middleware (minimal hosting inserts it at the very
++                // front of the pipeline whenever AddAuthentication has been called). That was verified
++                // with a diagnostic probe: entering this method with only a cookie and no identity
++                // header already yields IsAuthenticated=True with four claims. Assigning the result
++                // here would only shadow that behaviour — and it is the reason a pure-cookie session
++                // works without any per-request identity header.
++                //
++                // Before deleting or "using" this line, read the README section on cookie sessions.
+                 var isAuthenticated = await context.AuthenticateAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+ 
++                // Bounded account-state re-validation (see Authentication:SessionRevalidateSeconds).
++                await RevalidateSessionIfStaleAsync(context, userService, authOptions.Value);
++
+                 // Also check our custom service for 2FA state
+                 if (!authService.IsAuthenticated(context))
+                 {
+                     // Store the original URL for redirect after login
+                     var returnUrl = context.Request.Path + context.Request.QueryString;
+-                    context.Response.Redirect($"/Auth/Login?returnUrl={Uri.EscapeDataString(returnUrl)}");
++                    // PathBase-aware: under the fnOS gateway the app is mounted at /app/<name>/, and a bare
++                    // absolute path would drop the prefix and hit the gateway instead of this app.
++                    context.Response.Redirect($"{context.Request.PathBase}/Auth/Login?returnUrl={Uri.EscapeDataString(returnUrl)}");
+                     return;
+                 }
+             }
+@@ -66,6 +86,100 @@ namespace MailArchiver.Auth.Middlewares
+             await _next(context);
+         }
+ 
++        /// <summary>
++        /// Re-checks the account behind an existing session once the "chk" claim is older than the
++        /// configured interval. A disabled (or pending-approval) account is signed out on the spot, so
++        /// deactivating someone does not have to wait for the cookie to expire; a healthy account gets
++        /// a refreshed cookie with a new timestamp.
++        ///
++        /// Cost: one primary-key lookup per session per interval (default 5 minutes), not per request.
++        /// </summary>
++        private async Task RevalidateSessionIfStaleAsync(
++            HttpContext context,
++            IUserService userService,
++            MailArchiver.Models.AuthenticationOptions options)
++        {
++            if (context.User?.Identity?.IsAuthenticated != true)
++            {
++                return;
++            }
++
++            var interval = Math.Max(0, options.SessionRevalidateSeconds);
++            var checkedClaim = context.User.FindFirst(
++                MailArchiver.Auth.Services.CookieAuthenticationService.SessionCheckedClaimType)?.Value;
++
++            if (long.TryParse(checkedClaim, out var checkedAt))
++            {
++                var age = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - checkedAt;
++                if (age < interval)
++                {
++                    return;
++                }
++            }
++
++            var userIdClaim = context.User.FindFirst("UserId")?.Value;
++            if (!int.TryParse(userIdClaim, out var userId))
++            {
++                return;
++            }
++
++            MailArchiver.Models.User? account;
++            try
++            {
++                account = await userService.GetUserByIdAsync(userId);
++            }
++            catch (Exception ex)
++            {
++                // Availability first: a database hiccup must not sign everybody out.
++                _logger.LogWarning(ex, "Could not re-validate session for user {UserId}; continuing.", userId);
++                return;
++            }
++
++            if (account == null || !account.IsActive || account.RequiresApproval)
++            {
++                _logger.LogWarning(
++                    "Session denied (session-revalidation-failed): user {UserId} is {State}. Signing out.",
++                    userId,
++                    account == null ? "missing" : (!account.IsActive ? "disabled" : "pending approval"));
++
++                await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
++                context.User = new System.Security.Claims.ClaimsPrincipal(new System.Security.Claims.ClaimsIdentity());
++                return;
++            }
++
++            // Healthy: refresh the timestamp so the next interval starts now — WITHOUT changing the
++            // session's lifetime semantics. Re-issuing with a fresh ExpiresUtc on every re-validation
++            // would silently turn a 60-minute session into one that never expires, and forcing
++            // IsPersistent=false would quietly drop "remember me" for anyone who ticked it.
++            var gatewaySubject = context.User.FindFirst(
++                MailArchiver.Auth.Middlewares.GatewayAuthMiddleware.SubjectClaimType)?.Value;
++            var principal = BuildPrincipalThroughService(context, account, gatewaySubject);
++            if (principal != null)
++            {
++                var existing = await context.AuthenticateAsync(CookieAuthenticationDefaults.AuthenticationScheme);
++                var properties = existing?.Properties ?? new Microsoft.AspNetCore.Authentication.AuthenticationProperties();
++
++                // Keep whatever the original sign-in decided; only fill in a deadline if there was none.
++                if (properties.ExpiresUtc == null)
++                {
++                    properties.ExpiresUtc = DateTimeOffset.UtcNow.AddMinutes(Math.Max(1, options.SessionTimeoutMinutes));
++                }
++
++                await context.SignInAsync(
++                    CookieAuthenticationDefaults.AuthenticationScheme,
++                    principal,
++                    properties);
++                context.User = principal;
++            }
++        }
++
++        private static System.Security.Claims.ClaimsPrincipal? BuildPrincipalThroughService(
++            HttpContext context, MailArchiver.Models.User account, string? gatewaySubject)
++        {
++            var service = context.RequestServices.GetService<MailArchiver.Services.IAuthenticationService>();
++            return service?.BuildPrincipal(account, gatewaySubject);
++        }
++
+         private async Task HandleKeyedRequestAsync(HttpContext context, bool enabled)
+         {
+             // Disabled => behave as if the routes do not exist (do not leak existence).
+diff --git a/Auth/Middelwares/GatewayAuthMiddleware.cs b/Auth/Middelwares/GatewayAuthMiddleware.cs
+new file mode 100644
+index 0000000..d5c0954
+--- /dev/null
++++ b/Auth/Middelwares/GatewayAuthMiddleware.cs
+@@ -0,0 +1,529 @@
++using System.Security.Claims;
++using System.Text;
++using MailArchiver.Auth.Options;
++using MailArchiver.Models;
++using MailArchiver.Services;
++using Microsoft.AspNetCore.Authentication;
++using Microsoft.AspNetCore.Authentication.Cookies;
++using Microsoft.Extensions.Localization;
++using Microsoft.Extensions.Options;
++
++namespace MailArchiver.Auth.Middlewares
++{
++    /// <summary>
++    /// Sign-in bridge for the fnOS ("飞牛") unified gateway.
++    ///
++    /// Responsibility (and nothing more): if the request carries an fnOS uid that is already
++    /// linked to a local account, sign that account in and continue. It never creates accounts,
++    /// never changes roles, and never grants anything based on the gateway's admin header.
++    ///
++    /// Unbound identities are deliberately NOT handled here: the request falls through to the
++    /// normal pipeline, which redirects to the native login page. That page shows a hint and
++    /// performs the link once the user proves ownership of the local account with its password.
++    ///
++    /// Security invariants (see also the fpk delivery notes):
++    ///  * missing / malformed identity header  -> fall through to the native login flow
++    ///    (fall through is NOT authentication: the downstream AuthenticationMiddleware still
++    ///    redirects, so a caller without headers can never be treated as a user);
++    ///  * <c>X-Trim-Isadmin</c> is never read — authorisation comes from the local account only;
++    ///  * a disabled or pending local account is rejected, and those flags are never mutated here;
++    ///  * a native (password) session is never hijacked — that is the break-glass path.
++    /// </summary>
++    public class GatewayAuthMiddleware
++    {
++        /// <summary>
++        /// Cookie that remembers a *declined* consent decision, so the prompt is not shown again on
++        /// every visit. Chosen over a session entry because a session dies with the browser and the
++        /// user would be asked again on the next launch; 24h is long enough not to nag, short enough
++        /// that a mis-click is not permanent, and the login page offers an explicit way to re-open
++        /// the prompt.
++        /// </summary>
++        public const string ConsentCookieName = ".MailArchiverFnosConsent";
++
++        /// <summary>Cookie value meaning "the user declined the fnOS identity".</summary>
++        public const string ConsentDeclinedValue = "decline";
++
++        /// <summary>
++        /// Cookie value meaning "the user allowed it, but has not linked an account yet".
++        /// Remembering the allow as well keeps the prompt from reappearing on every visit while the
++        /// user has still to complete the one-time link on the login page.
++        /// </summary>
++        public const string ConsentAllowedValue = "allow";
++
++        /// <summary>Session key holding the unix-seconds timestamp of the last explicit sign-out.</summary>
++        public const string LogoutSuppressedAtKey = "GatewayLogoutSuppressedAt";
++
++        /// <summary>Claim stamped on gateway-issued sessions so they can be told apart from password sessions.</summary>
++        public const string SubjectClaimType = "gw_sub";
++
++        private readonly RequestDelegate _next;
++        private readonly ILogger<GatewayAuthMiddleware> _logger;
++
++        public GatewayAuthMiddleware(RequestDelegate next, ILogger<GatewayAuthMiddleware> logger)
++        {
++            _next = next;
++            _logger = logger;
++        }
++
++        public async Task InvokeAsync(
++            HttpContext context,
++            IOptions<GatewayOptions> gatewayOptions,
++            IUserService userService,
++            // Fully qualified: Microsoft.AspNetCore.Authentication also declares an IAuthenticationService.
++            MailArchiver.Services.IAuthenticationService authService,
++            IAccessLogService accessLogService,
++            SocketSecurityState socketSecurityState,
++            IOptions<MailArchiver.Models.AuthenticationOptions> authenticationOptions,
++            IStringLocalizer<SharedResource> localizer)
++        {
++            var options = gatewayOptions.Value;
++            if (!options.Enabled)
++            {
++                await _next(context);
++                return;
++            }
++
++            // The native auth endpoints must stay reachable without gateway auto-login:
++            //  - /Auth/Login  is where an unbound user proves account ownership and links it,
++            //  - /Auth/Logout must run before any re-sign-in,
++            //  - /Auth/Blocked, /TwoFactor are part of the native flows.
++            //
++            // /TwoFactor/ matters: an account that has 2FA enabled is rejected further down, but a
++            // verification that is already in flight must never be upgraded into a full session by
++            // this middleware.
++            var path = context.Request.Path.Value ?? string.Empty;
++            if (path.StartsWith("/auth/", StringComparison.OrdinalIgnoreCase)
++                || path.StartsWith("/twofactor/", StringComparison.OrdinalIgnoreCase))
++            {
++                await _next(context);
++                return;
++            }
++
++            if (ConsumeOneShotSkip(context, options))
++            {
++                await _next(context);
++                return;
++            }
++
++            if (!IsSharedSecretValid(context, options))
++            {
++                _logger.LogWarning(
++                    "Gateway request rejected: header '{Header}' missing or does not match the configured secret.",
++                    options.SharedSecretHeader);
++                await WriteTextAsync(context, StatusCodes.Status401Unauthorized, "invalid gateway credentials");
++                return;
++            }
++
++            if (!TryReadIdentity(context, options, out var uid, out var username))
++            {
++                // No identity on this request: internal health probes, direct socket debugging,
++                // or a future port-mode deployment. Fall through to the native flow.
++                await _next(context);
++                return;
++            }
++
++            // Fail-closed, but narrowly: only requests that would actually be authenticated from
++            // headers are refused. Computing this AFTER the identity read is deliberate — a
++            // request without headers keeps falling through to the native login page, which is the
++            // recovery path when the socket permissions are wrong. Refusing everything would turn a
++            // fixable permission problem into "the whole application is down".
++            // The gate is closed until the socket has been *proven* owner-only, not merely until an
++            // attempt has failed. Without the IsHardened half there is a cold-start hole: for the
++            // first moments after boot the background check has not run yet, so a socket created
++            // without a restrictive umask (e.g. someone overriding the image ENTRYPOINT) would be
++            // trusted for up to AppearanceGrace (30s). First chmod lands in the first loop
++            // iteration, so this only affects the first few milliseconds.
++            if (!socketSecurityState.IsHardened || socketSecurityState.HardeningFailed)
++            {
++                _logger.LogError(
++                    "Refusing gateway header authentication: unix socket '{SocketPath}' is not (yet) " +
++                    "restricted to 0600 (hardened={Hardened}, failed={Failed}). " +
++                    "Password sign-in via /Auth/Login still works.",
++                    socketSecurityState.SocketPath,
++                    socketSecurityState.IsHardened,
++                    socketSecurityState.HardeningFailed);
++                await WriteTextAsync(
++                    context,
++                    StatusCodes.Status503ServiceUnavailable,
++                    localizer["GatewaySocketNotHardened"].Value);
++                return;
++            }
++
++            var subject = options.SubjectPrefix + uid;
++
++            // A presented-but-unreadable auth cookie.
++            //
++            // Symptom on a real fpk install: after linking, reopening the app ends in
++            // ERR_TOO_MANY_REDIRECTS while only one "Gateway sign-in" is logged. Cause: the browser
++            // still holds a cookie with the same name issued by an earlier image (or the
++            // DataProtection key directory was not persisted), so it cannot be decrypted. The
++            // principal stays anonymous, we would sign in again and emit a fresh Set-Cookie on
++            // every single request while the stale cookie keeps shadowing it — a redirect storm
++            // that never converges.
++            //
++            // Do not fight it: drop the cookie this once and let the native flow continue. The next
++            // request arrives without it and the normal sign-in path runs.
++            var authCookieName = authenticationOptions.Value.CookieName;
++            if (!string.IsNullOrEmpty(context.Request.Cookies[authCookieName])
++                && context.User?.Identity?.IsAuthenticated != true)
++            {
++                _logger.LogWarning(
++                    "Auth cookie '{Cookie}' was presented but the session could not be decrypted " +
++                    "(stale DataProtection keys or a cookie left by a previous installation). " +
++                    "Clearing it instead of re-issuing a session on every request.",
++                    authCookieName);
++
++                // Delete both scopes: "/" is what older builds emitted, the path base is what this
++                // build emits. Deleting only one would leave the shadowing cookie in place.
++                var pathBase = context.Request.PathBase.HasValue ? context.Request.PathBase.Value! : "/";
++                context.Response.Cookies.Delete(authCookieName, new CookieOptions { Path = pathBase });
++                context.Response.Cookies.Delete(authCookieName, new CookieOptions { Path = "/" });
++
++                await _next(context);
++                return;
++            }
++
++            // Resolved before the session questions below, so the decision can take the link into
++            // account without a second query.
++            var boundUser = await userService.GetUserByGatewaySubjectAsync(subject);
++
++            if (context.User?.Identity?.IsAuthenticated == true)
++            {
++                var currentSubject = context.User.FindFirst(SubjectClaimType)?.Value;
++
++                // Same gateway identity: nothing to do (no DB round-trip on this hot path).
++                if (string.Equals(currentSubject, subject, StringComparison.Ordinal))
++                {
++                    await _next(context);
++                    return;
++                }
++
++                if (string.IsNullOrEmpty(currentSubject))
++                {
++                    // A password session (no gateway stamp). FOUR ordered outcomes — the order is part
++                    // of the contract, each one exists to prevent a specific failure:
++                    //
++                    // 1. BREAK-GLASS. The session belongs to the bootstrap administrator
++                    //    (Authentication:Username) and binding it is not allowed. It can never be
++                    //    linked, so without this exception it would be bounced to the login page on
++                    //    every single request while the gateway is healthy — the one account that must
++                    //    always work would stop working. Must stay first.
++                    //
++                    // 2. SWITCH. The incoming subject is linked to some account: the headers describe
++                    //    who the fnOS session belongs to right now, and a cookie issued earlier must
++                    //    not keep serving a different person (shared browser: B would otherwise see
++                    //    and act as A, possibly an administrator, for as long as the sliding session
++                    //    lives). Fall through to sign out and re-issue as the gateway identity.
++                    //
++                    // 3. ALREADY ANSWERED. The subject is not linked, but this browser has already
++                    //    answered the consent question (allow or decline, remembered for 24h). Keep
++                    //    the password session: without this, a user with an unlinked fnOS identity
++                    //    would be kicked to the consent screen on every request after signing in with
++                    //    a password — an unusable loop. Must stay before 4.
++                    //
++                    // 4. ASK. Not linked and no remembered decision: sign out and send the user to the
++                    //    consent screen. This is the branch that closes the identity leak — the old
++                    //    password session is NOT inherited by the next fnOS user. The page is
++                    //    actionable, so this is a step, not a dead end.
++                    var consentCookie = context.Request.Cookies[ConsentCookieName];
++                    var consentRemembered = consentCookie == ConsentAllowedValue
++                                            || consentCookie == ConsentDeclinedValue;
++
++                    var sessionAccount = context.User.Identity?.Name;
++                    var isBootstrapSession = !options.AllowBindBootstrapAdmin
++                                             && !string.IsNullOrEmpty(authenticationOptions.Value.Username)
++                                             && string.Equals(sessionAccount,
++                                                              authenticationOptions.Value.Username,
++                                                              StringComparison.OrdinalIgnoreCase);
++
++                    if (isBootstrapSession)
++                    {
++                        _logger.LogDebug(
++                            "Password session for the bootstrap administrator kept (break-glass); " +
++                            "fnOS identity {Subject} ignored.", subject);
++                        await _next(context);
++                        return;
++                    }
++
++                    if (boundUser != null)
++                    {
++                        _logger.LogInformation(
++                            "Gateway identity changed (password session -> fnOS identity {Subject}); re-issuing the session.",
++                            subject);
++                    }
++                    else if (consentRemembered)
++                    {
++                        _logger.LogDebug(
++                            "Password session kept: fnOS identity {Subject} is not linked and this browser " +
++                            "already answered the consent question.", subject);
++                        await _next(context);
++                        return;
++                    }
++                    else
++                    {
++                        _logger.LogInformation(
++                            "Password session dropped (identity-mixing-prevented): fnOS identity {Subject} is " +
++                            "not linked and no consent decision is remembered for this browser. " +
++                            "Sending the user to the consent step.",
++                            subject);
++
++                        await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
++                        context.User = new ClaimsPrincipal(new ClaimsIdentity());
++
++                        var consentReturnUrl = context.Request.Path + context.Request.QueryString;
++                        context.Response.Redirect(
++                            $"{context.Request.PathBase}/Auth/Consent?returnUrl={Uri.EscapeDataString(consentReturnUrl)}");
++                        return;
++                    }
++                }
++                else
++                {
++                    // A different fnOS user is now driving this browser (fnOS session switched).
++                    _logger.LogInformation(
++                        "Gateway identity changed from {Old} to {New}; re-issuing the session.",
++                        currentSubject, subject);
++                }
++
++                await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
++                context.User = new ClaimsPrincipal(new ClaimsIdentity());
++            }
++
++            var user = boundUser;
++            if (user == null)
++            {
++                // Nothing linked yet: ask for consent before anything else, mirroring the platform's
++                // own authorisation prompt. Deliberately limited to plain page GETs — an API/MCP
++                // caller must keep getting its 401 shape, and a POST must not be turned into a
++                // redirect that silently drops the body.
++                //
++                // Declining is remembered in a cookie; when it is present we fall through to the
++                // native login page instead of prompting again.
++                var consentCookie = context.Request.Cookies[ConsentCookieName];
++                var decisionRemembered = consentCookie == ConsentDeclinedValue || consentCookie == ConsentAllowedValue;
++                var isPageGet = HttpMethods.IsGet(context.Request.Method)
++                                && !path.StartsWith("/api/", StringComparison.OrdinalIgnoreCase)
++                                && !path.StartsWith("/mcp", StringComparison.OrdinalIgnoreCase);
++
++                if (isPageGet && !decisionRemembered)
++                {
++                    var returnUrl = context.Request.Path + context.Request.QueryString;
++                    _logger.LogDebug(
++                        "Gateway subject {Subject} is not linked yet; offering the consent step.", subject);
++                    context.Response.Redirect(
++                        $"{context.Request.PathBase}/Auth/Consent?returnUrl={Uri.EscapeDataString(returnUrl)}");
++                    return;
++                }
++
++                // Declined earlier, or not a page GET: fall through so the login page can offer the
++                // one-time link.
++                _logger.LogDebug("No local account linked to gateway subject {Subject}; falling back to native login.", subject);
++                await _next(context);
++                return;
++            }
++
++            // Fail-closed: never mutate these two flags, just refuse.
++            if (!user.IsActive || user.RequiresApproval)
++            {
++                var reason = !user.IsActive ? "disabled" : "pending approval";
++                _logger.LogWarning(
++                    "Gateway sign-in refused for account {Username} (id {UserId}): account is {Reason}.",
++                    user.Username, user.Id, reason);
++
++                await accessLogService.LogAccessAsync(
++                    user.Username,
++                    AccessLogType.Login,
++                    searchParameters: $"fnOS uid={uid} denied: account {reason}");
++
++                await WriteTextAsync(
++                    context,
++                    StatusCodes.Status403Forbidden,
++                    !user.IsActive
++                        ? localizer["GatewayAccountDisabled"].Value
++                        : localizer["GatewayAccountPendingApproval"].Value);
++                return;
++            }
++
++            // Fail-closed: an account that protects itself with a second factor must not be signed
++            // in by a path that never asks for it. This can happen after linking: the link is only
++            // created while 2FA is OFF, but the user may enable it afterwards. Silently ignoring it
++            // would make 2FA decorative while the UI still claims it is enabled.
++            if (user.IsTwoFactorEnabled)
++            {
++                _logger.LogWarning(
++                    "Gateway sign-in refused for account {Username} (id {UserId}): two-factor authentication is enabled.",
++                    user.Username, user.Id);
++
++                await accessLogService.LogAccessAsync(
++                    user.Username,
++                    AccessLogType.Login,
++                    searchParameters: $"fnOS uid={uid} denied: account requires two-factor authentication");
++
++                await WriteTextAsync(
++                    context,
++                    StatusCodes.Status403Forbidden,
++                    localizer["GatewayAccountRequiresTwoFactor"].Value);
++                return;
++            }
++
++            var principal = authService.BuildPrincipal(user, subject);
++            var authProperties = new AuthenticationProperties
++            {
++                IsPersistent = false,
++                IssuedUtc = DateTimeOffset.UtcNow,
++                ExpiresUtc = DateTimeOffset.UtcNow.AddMinutes(authService.GetSessionTimeoutMinutes())
++            };
++
++            await context.SignInAsync(
++                CookieAuthenticationDefaults.AuthenticationScheme, principal, authProperties);
++
++            // CRITICAL: SignInAsync only writes the response cookie. Without this assignment the
++            // *current* request is still anonymous and the downstream AuthenticationMiddleware
++            // would 302 it back to the login page (the classic "signed in but bounced" symptom).
++            context.User = principal;
++
++            await accessLogService.LogAccessAsync(
++                user.Username,
++                AccessLogType.Login,
++                searchParameters: $"fnOS uid={uid} via gateway");
++
++            await userService.TouchLastLoginAsync(user.Id);
++
++            _logger.LogInformation(
++                "Gateway sign-in: fnOS uid={Uid} ({UserName}) -> local account {Username} (id {UserId}).",
++                uid, username, user.Username, user.Id);
++
++            await _next(context);
++        }
++
++        /// <summary>
++        /// Reads the injected identity. Returns false when the request carries no usable uid.
++        ///
++        /// The uid is the only identity key: it is validated as pure ASCII digits so that it can
++        /// be embedded in the stored subject without escaping concerns. The user name is
++        /// best-effort and display-only.
++        /// </summary>
++        public static bool TryReadIdentity(HttpContext context, GatewayOptions options, out string uid, out string username)
++        {
++            uid = string.Empty;
++            username = string.Empty;
++
++            var rawUid = context.Request.Headers[options.UserIdHeader].ToString();
++            if (string.IsNullOrWhiteSpace(rawUid))
++            {
++                return false;
++            }
++
++            rawUid = rawUid.Trim();
++            if (rawUid.Length == 0 || rawUid.Length > 20 || !rawUid.All(char.IsAsciiDigit))
++            {
++                return false;
++            }
++
++            uid = rawUid;
++
++            var rawName = context.Request.Headers[options.UsernameHeader].ToString();
++            username = string.IsNullOrWhiteSpace(rawName)
++                ? string.Empty
++                : RepairUtf8HeaderText(rawName.Trim());
++
++            return true;
++        }
++
++        /// <summary>
++        /// Normalises the injected user name for display.
++        ///
++        /// HTTP header values are bytes; depending on the server they may arrive already decoded
++        /// as Unicode, or as UTF-8 bytes that were read as Latin-1 (mojibake). Two cases:
++        ///  * any character above U+00FF  -> already real Unicode, keep it untouched;
++        ///  * only characters up to U+00FF -> re-interpret the Latin-1 bytes as UTF-8, which is
++        ///    what fnOS actually sends. Invalid UTF-8 keeps the original string.
++        ///
++        /// Getting this wrong is not fatal (the uid is the identity key), but silently turning a
++        /// correct name into "????" would be. Hence the strict range check before converting.
++        /// </summary>
++        internal static string RepairUtf8HeaderText(string value)
++        {
++            if (value.Length == 0)
++            {
++                return value;
++            }
++
++            // Already real Unicode (e.g. the server decoded the header correctly), or plain ASCII.
++            if (value.Any(c => c > 0xFF) || value.All(c => c < 0x80))
++            {
++                return value;
++            }
++
++            try
++            {
++                // Every character is <= U+00FF here, so this is a lossless byte round-trip.
++                var bytes = Encoding.Latin1.GetBytes(value);
++                return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true)
++                    .GetString(bytes);
++            }
++            catch
++            {
++                return value;
++            }
++        }
++
++        /// <summary>
++        /// Consumes a ONE-SHOT skip for the request that directly follows a sign-out.
++        ///
++        /// Why one-shot: the previous design kept the skip armed for a fixed window (60s). Inside
++        /// that window the gateway identity was ignored — and because a linked account can no longer
++        /// use a password (UserService rejects any account whose OAuthRemoteUserId is set), neither
++        /// path worked. Users were locked out until the window expired or the container restarted.
++        ///
++        /// One request is all that is needed: the skip exists solely to stop the redirect that
++        /// follows sign-out from immediately signing the user back in. Removing the marker here
++        /// means every subsequent request falls back to normal auto sign-in, so a dead interval
++        /// cannot exist.
++        /// </summary>
++        private static bool ConsumeOneShotSkip(HttpContext context, GatewayOptions options)
++        {
++            var raw = context.Session.GetString(LogoutSuppressedAtKey);
++            if (string.IsNullOrEmpty(raw) || !long.TryParse(raw, out var unixSeconds))
++            {
++                return false;
++            }
++
++            // Consumed on first use, whatever the outcome.
++            context.Session.Remove(LogoutSuppressedAtKey);
++
++            var suppressedAt = DateTimeOffset.FromUnixTimeSeconds(unixSeconds);
++            return DateTimeOffset.UtcNow - suppressedAt < TimeSpan.FromSeconds(Math.Max(1, options.LogoutSuppressionSeconds));
++        }
++
++        private static bool IsSharedSecretValid(HttpContext context, GatewayOptions options)
++        {
++            if (string.IsNullOrWhiteSpace(options.SharedSecret))
++            {
++                return true;
++            }
++
++            var presented = context.Request.Headers[options.SharedSecretHeader].ToString();
++            if (string.IsNullOrEmpty(presented))
++            {
++                return false;
++            }
++
++            var expected = Encoding.UTF8.GetBytes(options.SharedSecret!);
++            var actual = Encoding.UTF8.GetBytes(presented);
++            return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(expected, actual);
++        }
++
++        private static async Task WriteTextAsync(HttpContext context, int statusCode, string message)
++        {
++            if (context.Response.HasStarted)
++            {
++                return;
++            }
++
++            context.Response.Clear();
++            context.Response.StatusCode = statusCode;
++            context.Response.ContentType = "text/plain; charset=utf-8";
++            await context.Response.WriteAsync(message);
++        }
++    }
++}
+diff --git a/Auth/Options/GatewayOptions.cs b/Auth/Options/GatewayOptions.cs
+new file mode 100644
+index 0000000..12f7a63
+--- /dev/null
++++ b/Auth/Options/GatewayOptions.cs
+@@ -0,0 +1,83 @@
++namespace MailArchiver.Auth.Options
++{
++    /// <summary>
++    /// Configuration for the fnOS ("飞牛") gateway identity bridge.
++    ///
++    /// The fnOS unified gateway authenticates the NAS session itself and then forwards the
++    /// request to this application over a unix domain socket, injecting the caller's identity
++    /// as HTTP headers. Because the application listens on a 0600 unix socket and publishes no
++    /// TCP port, "request arrived on the socket" is the trust boundary; these options only
++    /// describe how to read the injected identity.
++    ///
++    /// DELIBERATELY ABSENT: there is no admin/role option here. The gateway also sends
++    /// <c>X-Trim-Isadmin</c>, but this application does NOT read it and does NOT map it onto
++    /// <see cref="Models.User.IsAdmin"/>. Authorisation is decided solely by the local
++    /// Mail Archiver account. Do not add role mapping here without a separate design review.
++    /// </summary>
++    public class GatewayOptions
++    {
++        public const string Gateway = "Gateway";
++
++        /// <summary>Master switch. When false the middleware is a no-op and behaviour is
++        /// byte-for-byte identical to upstream.</summary>
++        public bool Enabled { get; set; } = false;
++
++        /// <summary>
++        /// Optional shared secret. Empty (default) means "skip the check" — correct for the
++        /// single-container fpk where the unix socket permission is the only trust boundary.
++        /// Set this only when a sidecar/proxy sits in front and can inject the header.
++        /// </summary>
++        public string? SharedSecret { get; set; }
++
++        /// <summary>Header carrying <see cref="SharedSecret"/>. Ignored when the secret is empty.</summary>
++        public string SharedSecretHeader { get; set; } = "X-Gateway-Secret";
++
++        /// <summary>Header carrying the fnOS OS uid. This is the ONLY identity key.</summary>
++        public string UserIdHeader { get; set; } = "X-Trim-Userid";
++
++        /// <summary>
++        /// Header carrying the fnOS user name. DISPLAY ONLY — it is a snapshot taken at fnOS
++        /// login time (it goes stale after a rename) and may contain non-ASCII characters, so it
++        /// must never be used as a lookup key.
++        /// </summary>
++        public string UsernameHeader { get; set; } = "X-Trim-Username";
++
++        /// <summary>
++        /// Where to send the browser after sign-out. Empty means "back to the application root",
++        /// which lands on the login page with the auto-login suppressed for
++        /// <see cref="LogoutSuppressionSeconds"/>.
++        /// </summary>
++        public string LogoutRedirectUrl { get; set; } = "";
++
++        /// <summary>
++        /// Upper bound for the ONE-SHOT skip that follows an explicit sign-out (default 15s).
++        ///
++        /// This is only a safety net against a stale marker, not a suppression window: the marker is
++        /// consumed by the first request that sees it, so auto sign-in resumes immediately
++        /// afterwards. Keeping this short is deliberate — a long window would recreate the
++        /// "neither password nor fnOS identity works" deadlock this replaced.
++        /// </summary>
++        public int LogoutSuppressionSeconds { get; set; } = 15;
++
++        /// <summary>
++        /// Prefix stored in <see cref="Models.User.OAuthRemoteUserId"/> so that a gateway subject
++        /// can never collide with an OIDC subject (which is stored bare).
++        /// </summary>
++        public string SubjectPrefix { get; set; } = "fnos:";
++
++        /// <summary>
++        /// Whether the bootstrap administrator (the account named by <c>Authentication:Username</c>)
++        /// may be linked to an fnOS identity.
++        ///
++        /// Default FALSE on purpose: linking an account permanently disables its password sign-in
++        /// (<see cref="Services.UserService.AuthenticateUserAsync"/> rejects any account whose
++        /// OAuthRemoteUserId is set). If the bootstrap administrator were linked and the gateway
++        /// path then broke — socket permissions, a PathBase change, a gateway upgrade — there would
++        /// be no way back into the application from the UI. Keeping one password-capable
++        /// administrator is the break-glass channel; see the recovery procedure in the delivery
++        /// notes. Set to true only if that administrator will also keep a second, unlinked admin
++        /// account around.
++        /// </summary>
++        public bool AllowBindBootstrapAdmin { get; set; } = false;
++    }
++}
+diff --git a/Auth/Services/CookieAuthenticationService.cs b/Auth/Services/CookieAuthenticationService.cs
+index a370ece..0ea5e5b 100644
+--- a/Auth/Services/CookieAuthenticationService.cs
++++ b/Auth/Services/CookieAuthenticationService.cs
+@@ -10,6 +10,9 @@ namespace MailArchiver.Auth.Services
+ {
+     public class CookieAuthenticationService : MailArchiver.Services.IAuthenticationService
+     {
++        /// <summary>Claim holding the unix-seconds timestamp of the last account-state validation.</summary>
++        public const string SessionCheckedClaimType = "chk";
++
+         private readonly Models.AuthenticationOptions _authOptions;
+         private readonly IUserService _userService;
+         private readonly MailArchiverDbContext _dbContext;
+@@ -41,18 +44,26 @@ namespace MailArchiver.Auth.Services
+             return _userService.AuthenticateUserAsync(username, password).Result;
+         }
+ 
+-        public async Task StartUserSessionAsync(
+-            User user
+-            , bool rememberMe = false)
++        /// <summary>
++        /// Session lifetime in minutes, from <c>Authentication:SessionTimeoutMinutes</c>.
++        /// </summary>
++        public int GetSessionTimeoutMinutes()
+         {
+-            // Get the user to build claims
+-            if (user == null)
+-            {
+-                _logger.LogWarning("Attempt to sign in non-existent user");
+-                return;
+-            }
++            return _authOptions.SessionTimeoutMinutes;
++        }
+ 
+-            // Create claims for the user
++        /// <summary>
++        /// Builds the claims principal for a local account. Single source of truth for the claim
++        /// shape, shared by the interactive login flows and the fnOS gateway bridge.
++        /// </summary>
++        /// <param name="user">The local account.</param>
++        /// <param name="gatewaySubject">
++        /// When signing in via the fnOS gateway, the external subject. It is stamped as a claim so
++        /// later requests can tell a gateway-issued session apart from a password-issued one
++        /// without a database round-trip.
++        /// </param>
++        public ClaimsPrincipal BuildPrincipal(User user, string? gatewaySubject = null)
++        {
+             var claims = new List<Claim>
+             {
+                 new Claim(ClaimTypes.Name, user.Username),
+@@ -71,8 +82,32 @@ namespace MailArchiver.Auth.Services
+                 claims.Add(new Claim(ClaimTypes.Role, "SelfManager"));
+             }
+ 
++            if (!string.IsNullOrEmpty(gatewaySubject))
++            {
++                claims.Add(new Claim(MailArchiver.Auth.Middlewares.GatewayAuthMiddleware.SubjectClaimType, gatewaySubject));
++            }
++
++            // Timestamp of the last account-state check. The request path re-validates a session only
++            // when this is older than Authentication:SessionRevalidateSeconds, which keeps a session
++            // able to notice a disabled account without a database round-trip on every request.
++            claims.Add(new Claim(SessionCheckedClaimType, DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString()));
++
+             var claimsIdentity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
+-            var claimsPrincipal = new ClaimsPrincipal(claimsIdentity);
++            return new ClaimsPrincipal(claimsIdentity);
++        }
++
++        public async Task StartUserSessionAsync(
++            User user
++            , bool rememberMe = false)
++        {
++            // Get the user to build claims
++            if (user == null)
++            {
++                _logger.LogWarning("Attempt to sign in non-existent user");
++                return;
++            }
++
++            var claimsPrincipal = BuildPrincipal(user);
+ 
+             // Configure authentication properties
+             var authProperties = new AuthenticationProperties
+diff --git a/Controllers/AuthController.cs b/Controllers/AuthController.cs
+index a12b5eb..7e91ca1 100644
+--- a/Controllers/AuthController.cs
++++ b/Controllers/AuthController.cs
+@@ -25,6 +25,9 @@ namespace MailArchiver.Controllers
+         private readonly IAccessLogService _accessLogService;
+         private readonly IServiceScopeFactory _serviceScopeFactory;
+         private readonly IOptions<OAuthOptions> _oAuthOptions;
++        private readonly IOptions<GatewayOptions> _gatewayOptions;
++        private readonly IConfiguration _configuration;
++        private readonly MailArchiverDbContext _dbContext;
+ 
+         public AuthController(
+             MailArchiver.Services.IAuthenticationService authService
+@@ -34,7 +37,10 @@ namespace MailArchiver.Controllers
+             , IStringLocalizer<SharedResource> localizer
+             , IAccessLogService accessLogService
+             , IServiceScopeFactory serviceScopeFactory
+-            , IOptions<OAuthOptions> oAuthOptions)
++            , IOptions<OAuthOptions> oAuthOptions
++            , IOptions<GatewayOptions> gatewayOptions
++            , IConfiguration configuration
++            , MailArchiverDbContext dbContext)
+         {
+             _authService = authService;
+             _authenticationHandler = authenticationHandler;
+@@ -44,10 +50,13 @@ namespace MailArchiver.Controllers
+             _accessLogService = accessLogService;
+             _serviceScopeFactory = serviceScopeFactory;
+             _oAuthOptions = oAuthOptions;
++            _gatewayOptions = gatewayOptions;
++            _configuration = configuration;
++            _dbContext = dbContext;
+         }
+ 
+         [HttpGet]
+-        public IActionResult Login(string returnUrl = null)
++        public async Task<IActionResult> Login(string returnUrl = null)
+         {
+             // If already authenticated, redirect to return URL or home
+             if (_authService.IsAuthenticated(HttpContext))
+@@ -56,6 +65,7 @@ namespace MailArchiver.Controllers
+             }
+ 
+             ConfigureOAuthViewData(returnUrl);
++            await PopulateGatewayBindViewDataAsync();
+ 
+             var oAuthEnabled = _oAuthOptions.Value?.Enabled ?? false;
+             var disablePasswordLogin = _oAuthOptions.Value?.DisablePasswordLogin ?? false;
+@@ -107,6 +117,183 @@ namespace MailArchiver.Controllers
+                 : _localizer["SignInWithOAuthProvider", displayName].Value;
+         }
+ 
++        /// <summary>
++        /// Tells the login view whether a fnOS identity is present but not yet linked, so the page
++        /// can explain that signing in once will link it. Informational only — the link itself is
++        /// written in the POST handler, after the account password has been verified.
++        /// </summary>
++        private async Task PopulateGatewayBindViewDataAsync()
++        {
++            var options = _gatewayOptions.Value;
++            ViewBag.GatewayBindUsername = null;
++
++            if (!options.Enabled)
++            {
++                return;
++            }
++
++            if (!MailArchiver.Auth.Middlewares.GatewayAuthMiddleware.TryReadIdentity(
++                    HttpContext, options, out var uid, out var username))
++            {
++                return;
++            }
++
++            var subject = options.SubjectPrefix + uid;
++
++            var linked = await _userService.GetUserByGatewaySubjectAsync(subject);
++            if (linked != null)
++            {
++                // Bound: the password form can never succeed for this account, so offer the
++                // passwordless route instead of a dead end.
++                ViewBag.GatewayContinueSubject = string.IsNullOrEmpty(username) ? $"uid {uid}" : username;
++                return;
++            }
++
++            // Display only: fall back to the uid when fnOS sent no usable user name.
++            ViewBag.GatewayBindUsername = string.IsNullOrEmpty(username) ? $"uid {uid}" : username;
++        }
++
++        /// <summary>
++        /// Writes the one-time fnOS link for an account whose password has just been verified.
++        ///
++        /// Security note: this runs only after <c>ValidateCredentials</c> succeeded, i.e. the caller
++        /// proved ownership of the account. That proof is the whole point — without it any fnOS
++        /// user could claim an existing (possibly administrator) account by simply opening the app.
++        ///
++        /// Accounts with 2FA enabled are skipped: linking before the second factor is presented
++        /// would let the fnOS identity take over the account while permanently bypassing 2FA.
++        /// </summary>
++        private async Task TryLinkGatewayIdentityAsync(User? user)
++        {
++            var options = _gatewayOptions.Value;
++            if (!options.Enabled || user == null)
++            {
++                return;
++            }
++
++            if (!MailArchiver.Auth.Middlewares.GatewayAuthMiddleware.TryReadIdentity(
++                    HttpContext, options, out var uid, out var username))
++            {
++                _logger.LogDebug("fnOS link skipped: no usable gateway identity on this request.");
++                return;
++            }
++
++            if (user.IsTwoFactorEnabled)
++            {
++                TempData["WarningMessage"] = _localizer["GatewayBindSkippedTwoFactor"].Value;
++                _logger.LogInformation(
++                    "Skipped fnOS link for user {Username}: two-factor authentication is enabled.", user.Username);
++                return;
++            }
++
++            var subject = options.SubjectPrefix + uid;
++
++            // M1: never link the bootstrap administrator by default.
++            // Linking an account permanently disables its password sign-in (UserService rejects any
++            // account whose OAuthRemoteUserId is set), and this is the only password-capable
++            // administrator we can be sure exists. If the gateway path then broke — socket
++            // permissions, a PathBase change, a gateway upgrade — there would be no way back into
++            // the application. Operators who accept that risk can opt in explicitly.
++            var bootstrapUsername = _configuration["Authentication:Username"];
++            if (!options.AllowBindBootstrapAdmin
++                && !string.IsNullOrWhiteSpace(bootstrapUsername)
++                && string.Equals(user.Username, bootstrapUsername, StringComparison.OrdinalIgnoreCase))
++            {
++                TempData["WarningMessage"] = _localizer["GatewayBindBlockedBootstrapAdmin"].Value;
++                _logger.LogWarning(
++                    "Refused to link fnOS uid {Uid} to the bootstrap administrator '{Username}'. " +
++                    "Set Gateway:AllowBindBootstrapAdmin=true to permit it.",
++                    uid, user.Username);
++                return;
++            }
++
++            // M1 (residual): a second administrator can be the one that matters. If this is the
++            // last active administrator left, linking it would leave the instance with no account
++            // that can still sign in with a password once anything goes wrong with the gateway.
++            // Count only administrators that can still sign in with a password: an account already
++            // linked to fnOS has its password channel disabled, so it cannot act as the break-glass
++            // account. GetAdminCountAsync() counts "IsAdmin && IsActive", which is too broad here —
++            // it would let two non-bootstrap admins be linked one after the other and leave nobody
++            // with a usable password.
++            var passwordCapableAdmins = await _dbContext.Users
++                .CountAsync(u => u.IsAdmin && u.IsActive && u.OAuthRemoteUserId == null);
++
++            if (user.IsAdmin && passwordCapableAdmins <= 1)
++            {
++                TempData["WarningMessage"] = _localizer["GatewayBindBlockedLastAdmin"].Value;
++                _logger.LogWarning(
++                    "Refused to link fnOS uid {Uid} to account '{Username}': it is the last active " +
++                    "administrator that can still sign in with a password.",
++                    uid, user.Username);
++                return;
++            }
++
++            var result = await _userService.TryBindGatewaySubjectAsync(user.Id, subject);
++
++            switch (result)
++            {
++                case GatewayBindResult.Success:
++                case GatewayBindResult.AlreadyBoundToSame:
++                    // IMPORTANT: the link was written with a targeted UPDATE that bypasses the EF
++                    // change tracker, so the tracked instance still carries a NULL in that column.
++                    // The subsequent HandleUserAuthenticated() performs a full-entity
++                    // UpdateUserAsync(); without re-reading, that write would revert the column to
++                    // NULL (observed on a live instance). Reload rather than assigning the property
++                    // so the fix does not depend on EF returning the same instance later on.
++                    await _dbContext.Entry(user).ReloadAsync();
++
++                    TempData["SuccessMessage"] = _localizer["GatewayBindSucceeded"].Value;
++                    await _accessLogService.LogAccessAsync(
++                        user.Username,
++                        AccessLogType.Account,
++                        searchParameters: $"link fnOS uid={uid} name={username}");
++                    _logger.LogInformation("Linked fnOS uid {Uid} to account {Username}.", uid, user.Username);
++                    break;
++
++                case GatewayBindResult.AccountAlreadyBound:
++                case GatewayBindResult.SubjectAlreadyBound:
++                    TempData["WarningMessage"] = _localizer["GatewayBindConflict"].Value;
++                    _logger.LogWarning(
++                        "fnOS link conflict for account {Username} and uid {Uid}: {Result}.", user.Username, uid, result);
++                    break;
++
++                default:
++                    TempData["WarningMessage"] = _localizer["GatewayBindFailed"].Value;
++                    _logger.LogWarning(
++                        "fnOS link failed for account {Username} and uid {Uid}: {Result}.", user.Username, uid, result);
++                    break;
++            }
++        }
++
++        /// <summary>
++        /// Returns a more accurate message than "invalid user/password" when the failure is
++        /// explained by an existing fnOS link. Only consulted while the gateway is enabled (i.e.
++        /// the caller arrived through fnOS), so it cannot be used to probe account state from the
++        /// open internet.
++        /// </summary>
++        private async Task<string?> DescribeLinkedAccountPasswordFailureAsync(string? username)
++        {
++            if (!_gatewayOptions.Value.Enabled || string.IsNullOrWhiteSpace(username))
++            {
++                return null;
++            }
++
++            var candidate = await _userService.GetUserByUsernameAsync(username);
++            if (candidate == null || string.IsNullOrEmpty(candidate.OAuthRemoteUserId))
++            {
++                return null;
++            }
++
++            // Distinct keyword on purpose: a wrong password and a linked account used to produce the
++            // same "Failed login attempt" line, which made both undiagnosable from the log.
++            _logger.LogWarning(
++                "Login rejected (account-linked-to-fnos): username={Username} subject={Subject}. " +
++                "Password sign-in is disabled for linked accounts; use the gateway identity.",
++                username, candidate.OAuthRemoteUserId);
++
++            return _localizer["GatewayBoundCannotPasswordLogin"].Value;
++        }
++
+         [HttpPost]
+         [ValidateAntiForgeryToken]
+         [EnableRateLimiting("LoginAttempts")]
+@@ -132,6 +319,10 @@ namespace MailArchiver.Controllers
+                          return RedirectToAction("Verify", "TwoFactor");
+                      }
+ 
++                    // fnOS gateway: perform the one-time account link now that the password
++                    // has been verified (proof of ownership). No-op when the gateway is off.
++                    await TryLinkGatewayIdentityAsync(user);
++
+                     await _authenticationHandler.HandleUserAuthenticated(
+                         CookieAuthenticationDefaults.AuthenticationScheme
+                         , model.Username
+@@ -161,7 +352,14 @@ namespace MailArchiver.Controllers
+                 }
+                 else
+                 {
+-                    ModelState.AddModelError("", _localizer["InvalidUserPassword"]);
++                    // A linked account can no longer sign in with a password (by design). When we
++                    // can tell that is what happened, say so instead of the generic message.
++                    var linkedMessage = await DescribeLinkedAccountPasswordFailureAsync(model.Username);
++                    ModelState.AddModelError("", linkedMessage ?? _localizer["InvalidUserPassword"]);
++
++                    // Whatever path produced the failure, never leave the user without a next step:
++                    // if a gateway identity is present and linked, surface the passwordless button.
++                    await PopulateGatewayBindViewDataAsync();
+                     _logger.LogWarning("Failed login attempt for username: {Username} from IP: {IP}", 
+                         model.Username, HttpContext.Connection.RemoteIpAddress);
+                 }
+@@ -270,10 +468,170 @@ namespace MailArchiver.Controllers
+             {
+                 // Regular sign out for non-OIDC users
+                 _authService.SignOut(HttpContext);
++
++                // fnOS gateway: the identity headers arrive on EVERY request, so without a short
++                // suppression window the very next request would sign the user straight back in
++                // and "log out" would be a no-op that looks like a bug.
++                var gatewayOptions = _gatewayOptions.Value;
++                if (gatewayOptions.Enabled)
++                {
++                    // Always start from a clean slate: a stale marker from an earlier sign-out must
++                    // never affect this one.
++                    HttpContext.Session.Remove(
++                        MailArchiver.Auth.Middlewares.GatewayAuthMiddleware.LogoutSuppressedAtKey);
++
++                    if (!string.IsNullOrWhiteSpace(gatewayOptions.LogoutRedirectUrl))
++                    {
++                        // An in-app target would be signed straight back in, so arm a ONE-SHOT skip
++                        // for exactly that hop. It is consumed by the next request either way.
++                        HttpContext.Session.SetString(
++                            MailArchiver.Auth.Middlewares.GatewayAuthMiddleware.LogoutSuppressedAtKey,
++                            DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString());
++                        return Redirect(gatewayOptions.LogoutRedirectUrl);
++                    }
++
++                    // Default landing: the login page. /auth/* is outside gateway auto sign-in, so
++                    // there is nothing to suppress — and, crucially, no window in which neither the
++                    // password nor the fnOS identity can be used. The page offers a one-click
++                    // "continue as <fnOS user>" button, so getting back in never requires waiting.
++                    return Redirect("~/Auth/Login?loggedOut=1");
++                }
++
+                 return RedirectToAction("Login");
+             }
+         }
+         
++        /// <summary>
++        /// Consent screen shown before an fnOS identity is linked to a local account.
++        ///
++        /// The platform's own "authorize this app" prompt is only available to clients compiled into
++        /// accountsrv, so this is our equivalent: it states what is being used (user name and uid,
++        /// for identification only), lets the user decline, and declines are remembered in a cookie
++        /// so the prompt does not reappear on every visit.
++        /// </summary>
++        [HttpGet]
++        public async Task<IActionResult> Consent(string returnUrl = null, string reset = null)
++        {
++            var options = _gatewayOptions.Value;
++            ViewData["ReturnUrl"] = returnUrl;
++
++            if (!options.Enabled)
++            {
++                return RedirectToLocal(returnUrl);
++            }
++
++            // "Re-open the prompt" link on the login page: clearing the remembered decline makes the
++            // next visit show the consent screen again.
++            if (!string.IsNullOrEmpty(reset))
++            {
++                Response.Cookies.Delete(MailArchiver.Auth.Middlewares.GatewayAuthMiddleware.ConsentCookieName, new CookieOptions
++                {
++                    Path = MailArchiver.Auth.Extensions.AddAuthExtension.NormalizePathBase(
++                        HttpContext.Request.PathBase.HasValue ? HttpContext.Request.PathBase.Value : null)
++                });
++                return RedirectToLocal(returnUrl);
++            }
++
++            if (_authService.IsAuthenticated(HttpContext))
++            {
++                // Already signed in — nothing to ask.
++                return RedirectToLocal(returnUrl);
++            }
++
++            if (!MailArchiver.Auth.Middlewares.GatewayAuthMiddleware.TryReadIdentity(HttpContext, options, out var uid, out var username))
++            {
++                return RedirectToLocal(returnUrl, fallbackToLogin: true);
++            }
++
++            var subject = options.SubjectPrefix + uid;
++            if (await _userService.GetUserByGatewaySubjectAsync(subject) != null)
++            {
++                // Linked between the redirect and this GET: no prompt needed.
++                return RedirectToLocal(returnUrl);
++            }
++
++            ViewBag.ConsentUid = uid;
++            ViewBag.ConsentUserName = string.IsNullOrEmpty(username) ? uid : username;
++            ViewBag.ConsentReturnUrl = returnUrl ?? "/";
++            return View();
++        }
++
++        /// <summary>
++        /// Records the consent decision. Allowing does not create a link by itself: linking still
++        /// requires proving ownership of a local account with its password. Declining writes nothing
++        /// but the "remembered" cookie and an audit entry.
++        /// </summary>
++        [HttpPost]
++        [ValidateAntiForgeryToken]
++        public async Task<IActionResult> ConsentDecision(string decision, string returnUrl = null)
++        {
++            var options = _gatewayOptions.Value;
++            if (!options.Enabled)
++            {
++                return RedirectToLocal(returnUrl);
++            }
++
++            if (!MailArchiver.Auth.Middlewares.GatewayAuthMiddleware.TryReadIdentity(HttpContext, options, out var uid, out var username))
++            {
++                return RedirectToLocal(returnUrl, fallbackToLogin: true);
++            }
++
++            var allow = string.Equals(decision, "allow", StringComparison.OrdinalIgnoreCase);
++            var path = MailArchiver.Auth.Extensions.AddAuthExtension.NormalizePathBase(
++                HttpContext.Request.PathBase.HasValue ? HttpContext.Request.PathBase.Value : null);
++
++            // Both answers are remembered for 24h. Without remembering the "allow" the prompt would
++            // reappear on every visit until the user happens to complete the one-time link, which
++            // reads like the click did nothing.
++            Response.Cookies.Append(
++                MailArchiver.Auth.Middlewares.GatewayAuthMiddleware.ConsentCookieName,
++                allow ? MailArchiver.Auth.Middlewares.GatewayAuthMiddleware.ConsentAllowedValue : MailArchiver.Auth.Middlewares.GatewayAuthMiddleware.ConsentDeclinedValue,
++                new CookieOptions
++                {
++                    Path = path,
++                    HttpOnly = true,
++                    SameSite = SameSiteMode.Lax,
++                    Secure = Request.IsHttps,
++                    Expires = DateTimeOffset.UtcNow.AddHours(24)
++                });
++
++            // Audited either way: "who allowed / declined what, for which fnOS identity, when".
++            await _accessLogService.LogAccessAsync(
++                string.IsNullOrEmpty(username) ? $"fnos:{uid}" : username,
++                AccessLogType.Account,
++                searchParameters: $"consent fnos uid={uid} name={username} decision={(allow ? "allow" : "decline")}");
++
++            _logger.LogInformation(
++                "fnOS identity consent recorded: uid={Uid} decision={Decision}", uid, allow ? "allow" : "decline");
++
++            // Land on the login page, never back on the consent screen or on the app root (which
++            // would immediately re-run this decision).
++            return RedirectToAction(nameof(Login), new
++            {
++                consent = allow ? "allow" : "denied",
++                returnUrl
++            });
++        }
++
++        /// <summary>
++        /// Re-enters the application through the gateway identity after a sign-out.
++        ///
++        /// This is the escape hatch that makes the post-logout state solvable: a linked account can
++        /// no longer use a password, so the login page must offer a way back to the passwordless
++        /// path instead of leaving the user with a form that is guaranteed to fail. Reachable
++        /// without authentication because /Auth/* is outside the gateway auto sign-in.
++        /// </summary>
++        [HttpPost]
++        [ValidateAntiForgeryToken]
++        public IActionResult GatewayContinue(string returnUrl = null)
++        {
++            HttpContext.Session.Remove(
++                MailArchiver.Auth.Middlewares.GatewayAuthMiddleware.LogoutSuppressedAtKey);
++
++            _logger.LogInformation("User resumed the session through the gateway identity (no password).");
++            return RedirectToLocal(returnUrl);
++        }
++
+         [HttpGet]
+         public IActionResult AccessDenied()
+         {
+@@ -290,13 +648,18 @@ namespace MailArchiver.Controllers
+             return View();
+         }
+ 
+-        private IActionResult RedirectToLocal(string returnUrl)
++        private IActionResult RedirectToLocal(string returnUrl, bool fallbackToLogin = false)
+         {
+             if (Url.IsLocalUrl(returnUrl))
+             {
+-                return Redirect(returnUrl);
++                // returnUrl carries no path base (Request.Path is already prefix-stripped), so it
++                // has to be put back or the browser lands on the gateway root instead of this app.
++                return Redirect(Request.PathBase.ToString() + returnUrl);
+             }
+-            return RedirectToAction("Index", "Home");
++
++            // Consent flows must never bounce an anonymous visitor to the dashboard: the login page
++            // is the only page that works without a session.
++            return fallbackToLogin ? RedirectToAction(nameof(Login)) : RedirectToAction("Index", "Home");
+         }
+     }
+ }
+diff --git a/Controllers/LocalizationController.cs b/Controllers/LocalizationController.cs
+index 89602e5..7427610 100644
+--- a/Controllers/LocalizationController.cs
++++ b/Controllers/LocalizationController.cs
+@@ -16,9 +16,11 @@ namespace MailArchiver.Controllers
+             );
+             if (string.IsNullOrEmpty(returnUrl) || !Url.IsLocalUrl(returnUrl))
+             {
+-                returnUrl = Url.Action("Index", "Home") ?? "/";
++                return RedirectToAction("Index", "Home");
+             }
+-            return Redirect(returnUrl);
++
++            // returnUrl is prefix-free; Url.Action would add the path base but a raw path would not.
++            return Redirect(Request.PathBase.ToString() + returnUrl);
+         }
+     }
+ }
+diff --git a/Controllers/UsersController.cs b/Controllers/UsersController.cs
+index 8f6f2f1..52fc3cb 100644
+--- a/Controllers/UsersController.cs
++++ b/Controllers/UsersController.cs
+@@ -182,9 +182,70 @@ namespace MailArchiver.Controllers
+             ViewBag.IsOidcUser = !string.IsNullOrEmpty(user.OAuthRemoteUserId);
+             ViewBag.IsTwoFactorEnabled = user.IsTwoFactorEnabled;
+ 
++            // fnOS link ("1:1 account binding"): show what this account is linked to so an
++            // administrator can audit and, if needed, remove the link.
++            ViewBag.GatewaySubject = !string.IsNullOrEmpty(user.OAuthRemoteUserId)
++                                     && user.OAuthRemoteUserId.StartsWith("fnos:", StringComparison.Ordinal)
++                ? user.OAuthRemoteUserId
++                : null;
++
+             return View(model);
+         }
+ 
++        // POST: Users/UnbindGateway/5
++        // Removes the fnOS link from an account. Clearing that one column is all that is needed:
++        // every "external account" restriction is expressed as !IsNullOrEmpty(OAuthRemoteUserId),
++        // so password sign-in, password change and 2FA become available again automatically.
++        [HttpPost]
++        [ValidateAntiForgeryToken]
++        [AdminRequired]
++        public async Task<IActionResult> UnbindGateway(int id)
++        {
++            var user = await _userService.GetUserByIdAsync(id);
++            if (user == null)
++            {
++                return NotFound();
++            }
++
++            // Read the subject into a local before updating: the write below bypasses the EF change
++            // tracker, so reading it back off the entity afterwards would be unreliable.
++            var subject = user.OAuthRemoteUserId;
++            var outcome = await _userService.UnbindGatewaySubjectAsync(id);
++
++            switch (outcome)
++            {
++                case GatewayUnbindOutcome.Success:
++                    _logger.LogInformation(
++                        "Administrator removed the fnOS link ({Subject}) from user {Username} (ID: {UserId}).",
++                        subject, user.Username, user.Id);
++
++                    await _accessLogService.LogAccessAsync(
++                        user.Username,
++                        AccessLogType.Account,
++                        searchParameters: $"unlink fnOS subject={subject}");
++
++                    TempData["SuccessMessage"] = _localizer["GatewayUnbindSucceeded"].Value;
++                    break;
++
++                // The two refusals are worded differently on purpose: one is about a missing
++                // password, the other about being the last reachable administrator. Collapsing them
++                // into a single message would leave the administrator guessing what to fix.
++                case GatewayUnbindOutcome.AdministratorWithoutPassword:
++                    TempData["ErrorMessage"] = _localizer["GatewayUnbindBlockedNoPassword", user.Username].Value;
++                    break;
++
++                case GatewayUnbindOutcome.LastReachableAdministrator:
++                    TempData["ErrorMessage"] = _localizer["GatewayUnbindBlockedLastAdmin", user.Username].Value;
++                    break;
++
++                default:
++                    TempData["ErrorMessage"] = _localizer["GatewayUnbindNoop"].Value;
++                    break;
++            }
++
++            return RedirectToAction(nameof(Edit), new { id });
++        }
++
+         // POST: Users/Edit/5
+         [HttpPost]
+         [ValidateAntiForgeryToken]
+diff --git a/Dockerfile b/Dockerfile
+index 033a1b4..bc0b391 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,13 +1,27 @@
++# Mail-Archiver — fnOS (飞牛) fpk build.
++#
++# Differences from the upstream Dockerfile:
++#   * no TCP endpoint is published: the fnOS unified gateway connects to a unix domain socket
++#     (LISTEN_UNIX_SOCKET) and the socket is tightened to 0600 at startup by
++#     Services/UnixSocketPermissionService.cs. See the fpk delivery notes.
++#   * ASPNETCORE_URLS is intentionally NOT set. With LISTEN_UNIX_SOCKET the application clears
++#     every configured TCP endpoint; without it Kestrel falls back to http://localhost:5000,
++#     which is loopback-only — the right default for local debugging.
++#
++# Build (note the ARG for the pinned upstream commit used to produce the patch):
++#   docker build -t mailarchiver-fnos:p1 .
++
+ FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+ 
+ WORKDIR /app
+ 
+ COPY . ./
+-RUN dotnet restore MailArchiver.csproj && dotnet publish MailArchiver.csproj -c Release -o out
++RUN dotnet restore MailArchiver.csproj \
++ && dotnet publish MailArchiver.csproj -c Release -o out /p:UseAppHost=false
+ 
+ FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
+ 
+-# Install Kerberos library required by MailKit (libgssapi_krb5.so.2)r
++# MailKit needs libgssapi_krb5.so.2 for Kerberos/GSSAPI IMAP authentication.
+ RUN apt-get update \
+     && apt-get install -y --no-install-recommends libgssapi-krb5-2 \
+     && rm -rf /var/lib/apt/lists/*
+@@ -16,11 +30,72 @@ WORKDIR /app
+ 
+ COPY --from=build /app/out ./
+ 
+-ENV ASPNETCORE_URLS=http://+:5000
+-ENV ASPNETCORE_ENVIRONMENT=Production
++# The fpk runs the container as the package user (non-root, e.g. TRIM_UID). The published files
++# are owned by root, so make them world-readable and traversable — but deliberately NOT writable:
++# appsettings.json is configuration, not state.
++# Normalise the published tree: readable/traversable by everyone, writable only by the owner.
++# (A plain "chmod -R a+rX" only ADDS bits — it would leave behind any group/other write bit that
++# came in through the build context, and appsettings.json was measured as 0777 that way.)
++RUN chmod -R u+rwX,go+rX,go-w /app \
++ && chmod 0444 /app/appsettings.json
+ 
+-EXPOSE 5000
++# Writable state directories.
++#
++# They must exist and be writable by an *unknown* uid, because the fpk runs the container as the
++# package user (TRIM_UID). Creating them in the entrypoint is not possible: /app is root-owned and
++# 0755, so a non-root process cannot mkdir underneath it — measured: the container died at start-up
++# with "Access to the path '/app/uploads' is denied".
++#
++# 0777 (deliberately NOT the 1777 used in the ad-hoc workaround) is scoped to these four leaf
++# directories only, never recursive, and they live inside the image layer — not on a host bind
++# mount — so nothing outside the container is exposed. Files written into them still get 0600 from
++# the 0077 umask and are owned by the runtime user.
++# For persistence the fpk should bind-mount these paths under ${TRIM_PKGVAR}; the host directory's
++# ownership then governs and this mode is irrelevant.
++RUN mkdir -p /app/uploads /app/uploads/eml /app/uploads/mbox /app/exports /app/exports/audit \
++             /app/logs /app/DataProtection-Keys \
++ && chmod 0777 /app/uploads /app/uploads/eml /app/uploads/mbox /app/exports /app/exports/audit \
++               /app/logs /app/DataProtection-Keys
+ 
++ENV ASPNETCORE_ENVIRONMENT=Production
+ ENV TZ=UTC
+ 
+-ENTRYPOINT ["dotnet", "MailArchiver.dll"]
++# Upstream parity for standalone (non-fpk) use: listen on TCP 5000 like the official image.
++# When LISTEN_UNIX_SOCKET is set, Program.cs clears every configured URL before configuring
++# Kestrel, so this endpoint is NOT created in the fpk — verified on a live instance: no TCP
++# socket is listening and no port is published.
++ENV ASPNETCORE_URLS=http://+:5000
++
++# Mount points used by the fpk lifecycle scripts:
++#   /app/DataProtection-Keys  -> must persist, otherwise every restart invalidates the auth cookies
++#   /app/logs                 -> optional
++# The socket itself lives in the fnOS app target directory (${TRIM_APPDEST}) and is passed in
++# through LISTEN_UNIX_SOCKET, e.g. /var/apps/mailarchiver-fnos/target/app.sock
++
++# Socket permissions are the ONLY trust boundary for the identity headers injected by the fnOS
++# gateway, so the socket must never exist in a world-accessible state — not even for the few
++# milliseconds before a background poll could chmod it.
++#
++# `umask 0077` (NOT 0177) is what makes that atomic. Measured on a live instance:
++#   * socket    — created as 0700 (0777 & ~0077). Owner-only: no group/other bits, so no other
++#                 local user can connect (connect() needs write permission). The application then
++#                 narrows it to 0600; the two are equivalent for a socket.
++#   * directory — created as 0700 (0777 & ~0077): owner-only AND traversable, which is what a
++#                 directory needs.
++# With umask 0177 the socket would also be 0600 — but directories would come out as 0600, i.e.
++# without the execute bit, so the owner cannot even enter the directory it just created. The mkdir
++# itself succeeds and the failure only surfaces later as "Permission denied" on the first write.
++# That silently breaks every directory the application creates at runtime: /app/exports,
++# /app/uploads/eml, /app/uploads/mbox, the audit-export output directory and
++# /app/DataProtection-Keys (the last one would invalidate every session on restart).
++#
++# The application still re-applies the socket mode at start-up as a belt-and-braces check and
++# refuses to trust gateway headers if that fails (fail-closed).
++#
++# Writable directories are created HERE, not at build time: the container may run as any uid
++# (fnOS passes TRIM_UID), so build-time directories would be owned by root and the service would
++# fail on the first write (crash loop). Creating them at start-up as the runtime user gives the
++# correct owner without resorting to a world-writable 1777.
++# umask 0077 makes them 0700 — sufficient for this process (it is the owner) and not readable by
++# other local users, which is what we want for archived mail and the DataProtection keys.
++ENTRYPOINT ["/bin/sh", "-c", "umask 0077; mkdir -p /app/uploads /app/uploads/eml /app/uploads/mbox /app/exports /app/exports/audit /app/logs /app/DataProtection-Keys 2>/dev/null || true; exec dotnet MailArchiver.dll"]
+diff --git a/Models/AuthenticationOptions.cs b/Models/AuthenticationOptions.cs
+index 36e2a7a..b66b586 100644
+--- a/Models/AuthenticationOptions.cs
++++ b/Models/AuthenticationOptions.cs
+@@ -17,5 +17,59 @@ namespace MailArchiver.Models
+         /// Use "Lax" to allow navigation from external links while maintaining CSRF protection.
+         /// </summary>
+         public string CookieSameSite { get; set; } = "Strict";
++
++        /// <summary>
++        /// Path the authentication cookie is scoped to.
++        ///
++        /// Empty (default) means "derive it from the application path base" — under the fnOS
++        /// gateway that is /app/&lt;name&gt;, and for a plain root deployment it stays "/", matching
++        /// upstream behaviour.
++        ///
++        /// Why this is not hard-coded: leaving it unset makes the cookie handler emit "path=/",
++        /// which scopes the session cookie to the ENTIRE origin — every path of the NAS UI and every
++        /// other application served from it. A stale cookie with the same name left behind by a
++        /// previous installation then shadows the current one and the session can never be
++        /// established. Set this explicitly only if the app is mounted somewhere unusual.
++        /// </summary>
++        public string? CookiePath { get; set; }
++
++        /// <summary>
++        /// When true, the bootstrap administrator's password is forced to match
++        /// <see cref="Password"/> on every start-up.
++        ///
++        /// Background: the configured password is only used to CREATE the account; once the account
++        /// exists the stored hash wins and the configuration value is ignored. That is what makes a
++        /// settings page which edits this key look like it "changed the password" while nothing
++        /// changes. Enabling this makes the configuration the single source of truth again (an
++        /// fpk-managed password), at the cost of overwriting a password changed inside the app on the
++        /// next restart. Off by default: overwriting a working password silently is the worse
++        /// failure mode.
++        /// </summary>
++        public bool SyncPasswordFromConfig { get; set; } = false;
++
++        /// <summary>
++        /// How often an existing session is re-checked against the account's state.
++        ///
++        /// Deactivating an account must not leave an already-issued cookie able to browse the archive,
++        /// but checking on every request would add a primary-key lookup to every page load. A session
++        /// records when it was last checked (the "chk" claim) and is re-validated once this interval
++        /// has elapsed: bounded staleness, bounded cost. Default 300s (5 minutes). Set to 0 to
++        /// re-validate on every request.
++        /// </summary>
++        public int SessionRevalidateSeconds { get; set; } = 300;
++
++        /// <summary>
++        /// Failed login attempts allowed per partition before answering HTTP 429.
++        ///
++        /// Raised from the hard-coded 5 because on the fnOS gateway deployment every request
++        /// arrives over one unix socket; without a per-user partition key (see Program.cs) all
++        /// users would share a single bucket, and a handful of typos by one person would lock
++        /// everybody out. Configurable so the fpk can tune it without a rebuild.
++        /// Counters live in process memory: restarting the container clears them.
++        /// </summary>
++        public int LoginRateLimitPermitLimit { get; set; } = 20;
++
++        /// <summary>Window, in minutes, for <see cref="LoginRateLimitPermitLimit"/>.</summary>
++        public int LoginRateLimitWindowMinutes { get; set; } = 10;
+     }
+ }
+diff --git a/Models/GatewayBindResult.cs b/Models/GatewayBindResult.cs
+new file mode 100644
+index 0000000..d085a60
+--- /dev/null
++++ b/Models/GatewayBindResult.cs
+@@ -0,0 +1,59 @@
++namespace MailArchiver.Models
++{
++    /// <summary>
++    /// Outcome of attempting to link an fnOS identity to a local Mail Archiver account.
++    /// </summary>
++    public enum GatewayBindResult
++    {
++        /// <summary>The link was written.</summary>
++        Success,
++
++        /// <summary>The account is already linked to this very subject — treated as success.</summary>
++        AlreadyBoundToSame,
++
++        /// <summary>The local account is already linked to a different fnOS user.</summary>
++        AccountAlreadyBound,
++
++        /// <summary>The fnOS user is already linked to a different local account.</summary>
++        SubjectAlreadyBound,
++
++        /// <summary>No such local account.</summary>
++        UserNotFound,
++
++        /// <summary>The subject was empty or malformed.</summary>
++        InvalidSubject
++    }
++}
++
++namespace MailArchiver.Models
++{
++    /// <summary>
++    /// Outcome of removing an fnOS link from a local account.
++    ///
++    /// Unlinking re-enables the password channel, so it cannot by itself reduce the number of
++    /// reachable administrators — except when the account has no password at all: then unlinking
++    /// turns it into an account nobody can sign in with. That is the case the guard refuses, so an
++    /// installation can never end up with an administrator it has no way to log in as.
++    /// </summary>
++    public enum GatewayUnbindOutcome
++    {
++        /// <summary>The link was removed.</summary>
++        Success,
++
++        /// <summary>No such account.</summary>
++        UserNotFound,
++
++        /// <summary>The account had no link to remove.</summary>
++        NotLinked,
++
++        /// <summary>
++        /// Refused: this administrator has no password, so unlinking would leave it unreachable.
++        /// </summary>
++        AdministratorWithoutPassword,
++
++        /// <summary>
++        /// Refused: it is the only administrator left that can still sign in with a password.
++        /// </summary>
++        LastReachableAdministrator
++    }
++}
+diff --git a/Program.cs b/Program.cs
+index 2dc6154..9df493a 100644
+--- a/Program.cs
++++ b/Program.cs
+@@ -8,12 +8,16 @@ using MailArchiver.Services.Providers;
+ using MailArchiver.Services.Security;
+ using Microsoft.AspNetCore.DataProtection;
+ using Microsoft.AspNetCore.HttpOverrides;
++using Microsoft.AspNetCore.Localization;
+ using Microsoft.EntityFrameworkCore;
+ using Microsoft.Extensions.Options;
+ using System.Threading.RateLimiting;
+ 
+ AppContext.SetSwitch("Npgsql.EnableLegacyTimestampBehavior", true);
+ 
++// Request item used to tell the rejection logger which rate-limit bucket tripped.
++const string RateLimitTierKey = "RateLimitTier";
++
+ // Helper method to parse SameSite mode from string
+ static SameSiteMode ParseSameSiteMode(string? value)
+ {
+@@ -66,6 +70,62 @@ async static Task EnsureMigrationsHistoryTableExists(MailArchiverDbContext conte
+ 
+ var builder = WebApplication.CreateBuilder(args);
+ 
++// ===== fnOS fpk: listen on a unix domain socket instead of a TCP port ==================
++// Registered unconditionally: GatewayAuthMiddleware depends on it even when the bridge is off
++// (in TCP mode the state simply stays "hardening not applicable / not failed").
++builder.Services.AddSingleton<MailArchiver.Services.SocketSecurityState>();
++
++// The fnOS unified gateway connects to ${TRIM_APPDEST}/app.sock and publishes no TCP port,
++// so the socket's file permissions are the only trust boundary for the injected identity
++// headers. When LISTEN_UNIX_SOCKET is unset the upstream behaviour (ASPNETCORE_URLS) is kept,
++// which is what you want for local development.
++var listenUnixSocket = Environment.GetEnvironmentVariable("LISTEN_UNIX_SOCKET");
++if (!string.IsNullOrWhiteSpace(listenUnixSocket))
++{
++    listenUnixSocket = listenUnixSocket.Trim();
++
++    // Kestrel refuses to bind an existing path. A socket left behind by a previous run (or a
++    // crash) is stale by definition at this point, so remove it.
++    try
++    {
++        if (Path.Exists(listenUnixSocket))
++        {
++            File.Delete(listenUnixSocket);
++        }
++    }
++    catch (Exception ex)
++    {
++        Console.Error.WriteLine($"[startup] Could not remove stale socket '{listenUnixSocket}': {ex.Message}");
++    }
++
++    // Drop every configured TCP endpoint so the process is reachable ONLY through the socket.
++    builder.WebHost.UseSetting(WebHostDefaults.ServerUrlsKey, string.Empty);
++    builder.WebHost.ConfigureKestrel(options => options.ListenUnixSocket(listenUnixSocket));
++
++    // The gateway bridge reads this state to fail closed if the socket could not be restricted
++    // to the owning user (registered above, unconditionally).
++    builder.Services.AddHostedService(
++        provider => new MailArchiver.Services.UnixSocketPermissionService(
++            listenUnixSocket,
++            provider.GetRequiredService<MailArchiver.Services.SocketSecurityState>(),
++            provider.GetRequiredService<ILogger<MailArchiver.Services.UnixSocketPermissionService>>()));
++}
++
++// Deployment-error guard: the gateway bridge trusts identity headers on the assumption that the
++// ONLY way into this process is the owner-only unix socket. Running the bridge over TCP breaks
++// that assumption — anyone who can reach the port could impersonate any fnOS user. Warn loudly,
++// but do not exit: refusing to start would make the app uninstallable on a misconfigured box.
++if (builder.Configuration.GetValue<bool>("Gateway:Enabled") && string.IsNullOrWhiteSpace(listenUnixSocket))
++{
++    var gatewayLogger = builder.Services.BuildServiceProvider().GetRequiredService<ILogger<Program>>();
++    gatewayLogger.LogError(
++        "Gateway bridge is enabled but LISTEN_UNIX_SOCKET is empty: the application is listening on " +
++        "TCP, so the X-Trim-* identity headers are NOT protected by socket permissions. Any client " +
++        "that can reach the port can impersonate any fnOS user. Either publish no TCP port and set " +
++        "LISTEN_UNIX_SOCKET, or set Gateway:Enabled=false.");
++}
++// =======================================================================================
++
+ // Configure Forwarded Headers for reverse proxy support
+ builder.Services.Configure<ForwardedHeadersOptions>(options =>
+ {
+@@ -106,6 +166,12 @@ builder.Services.Configure<AuthenticationOptions>(
+ builder.Services.Configure<OAuthOptions>(
+     builder.Configuration.GetSection(OAuthOptions.OAuth));
+ 
++// Add fnOS gateway options (identity headers injected by the fnOS unified gateway).
++// Note: this section deliberately has no role/admin mapping — authorisation stays with the
++// local account. See Auth/Options/GatewayOptions.cs.
++builder.Services.Configure<GatewayOptions>(
++    builder.Configuration.GetSection(GatewayOptions.Gateway));
++
+ // Add Batch Restore Options
+ builder.Services.Configure<BatchRestoreOptions>(
+     builder.Configuration.GetSection(BatchRestoreOptions.BatchRestore));
+@@ -242,18 +308,79 @@ builder.Services.AddDataProtection()
+ // Add Rate Limiting
+ builder.Services.AddRateLimiter(options =>
+ {
+-    // Login Attempt Rate Limiting: 5 attempts per 10 minutes per IP
++    // fnOS gateway deployments: every request arrives over a single unix socket, so
++    // Connection.RemoteIpAddress is null and a naive per-IP key would put EVERY user in the same
++    // bucket — five typos by one person would lock the whole NAS out for ten minutes. When the
++    // gateway bridge is enabled the injected uid is a trustworthy partition key (the socket is
++    // owner-only, so nothing else can reach this process). Read once at start-up; the header is
++    // never consulted when the bridge is off, so it cannot be spoofed to bypass throttling on a
++    // plain TCP deployment.
++    var gatewayRateLimitEnabled = builder.Configuration.GetValue<bool>("Gateway:Enabled");
++    var gatewayRateLimitUidHeader = builder.Configuration.GetValue<string>("Gateway:UserIdHeader") ?? "X-Trim-Userid";
++    var loginPermitLimit = builder.Configuration.GetValue<int?>("Authentication:LoginRateLimitPermitLimit") ?? 20;
++    var loginWindowMinutes = builder.Configuration.GetValue<int?>("Authentication:LoginRateLimitWindowMinutes") ?? 10;
++    if (loginPermitLimit < 1) loginPermitLimit = 20;
++    if (loginWindowMinutes < 1) loginWindowMinutes = 10;
++
++    // Login Attempt Rate Limiting (default: 20 attempts / 10 minutes per identity).
++    // Counters are held in process memory — restarting the container clears them, which is the
++    // documented way out if an administrator manages to lock themselves out.
+     options.AddPolicy("LoginAttempts", httpContext =>
+     {
+-        var clientIp = httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+-        var partitionKey = $"login-{clientIp}";
+-        
++        // Partition key: the fnOS uid when the gateway bridge is on, the client IP otherwise.
++        //
++        // Kept exactly as it was: a controlled experiment on the live appliance showed the uid
++        // partition already isolates users correctly (uid A exhausted -> uid B still logs in;
++        // stopping the container clears the counters; the blocked page is shown with a Chinese
++        // message). Only requests that carry no identity header share the "unknown" bucket, which a
++        // normal browser never produces. Do not "improve" this without repeating that experiment.
++        // Tier 1 — per identity. The fnOS uid when available (production: every request carries it),
++        // otherwise the browser's antiforgery fingerprint, which is issued once per session and then
++        // reused (measured), so one person's typos cannot exhaust a bucket shared by everybody.
++        var partitionKey = $"login-{httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown"}";
++        httpContext.Items[RateLimitTierKey] = "ip";
++
++        if (gatewayRateLimitEnabled)
++        {
++            var uid = httpContext.Request.Headers[gatewayRateLimitUidHeader].ToString();
++            if (!string.IsNullOrWhiteSpace(uid))
++            {
++                uid = uid.Trim();
++                if (uid.Length is > 0 and <= 20 && uid.All(char.IsAsciiDigit))
++                {
++                    partitionKey = $"login-uid-{uid}";
++                    httpContext.Items[RateLimitTierKey] = "uid";
++                }
++            }
++        }
++
++        if (httpContext.Items[RateLimitTierKey] as string == "ip")
++        {
++            string? csrf = null;
++            foreach (var cookieName in httpContext.Request.Cookies.Keys)
++            {
++                if (cookieName.StartsWith(".AspNetCore.Antiforgery", StringComparison.Ordinal))
++                {
++                    csrf = httpContext.Request.Cookies[cookieName];
++                    break;
++                }
++            }
++
++            if (!string.IsNullOrEmpty(csrf))
++            {
++                using var sha = System.Security.Cryptography.SHA256.Create();
++                var hash = Convert.ToHexString(sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(csrf)));
++                partitionKey = $"login-session-{hash[..16]}";
++                httpContext.Items[RateLimitTierKey] = "session";
++            }
++        }
++
+         return RateLimitPartition.GetFixedWindowLimiter(
+             partitionKey,
+             _ => new FixedWindowRateLimiterOptions
+             {
+-                PermitLimit = 5,
+-                Window = TimeSpan.FromMinutes(10),
++                PermitLimit = loginPermitLimit,
++                Window = TimeSpan.FromMinutes(loginWindowMinutes),
+                 QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                 QueueLimit = 0
+             });
+@@ -370,7 +497,50 @@ builder.Services.AddRateLimiter(options =>
+         var path = context.HttpContext.Request.Path.Value?.ToLowerInvariant() ?? "";
+         if (path.Contains("/auth/login") || path.Contains("/twofactor/verify"))
+         {
+-            context.HttpContext.Response.Redirect("/Auth/Blocked");
++            // Visibility: until now a throttled sign-in only produced a redirect to a page whose
++            // text talks about account approval, and nothing at all in the log. Operators could not
++            // tell "wrong password" from "throttled", and neither could the user.
++            var services = context.HttpContext.RequestServices;
++            var rejectLogger = services.GetService<ILogger<Program>>();
++            var rejectLocalizer = services.GetService<Microsoft.Extensions.Localization.IStringLocalizer<MailArchiver.SharedResource>>();
++
++            // The partition key is the fnOS uid when the gateway bridge is on, the client IP
++            // otherwise — logging it is what makes a per-user throttle debuggable.
++            // Which bucket tripped: the uid, the browser session, or the global fallback. Without this
++            // a post-mortem cannot tell a user fumbling their password from a scanning loop that keeps
++            // throwing its cookies away.
++            var tier = context.HttpContext.Items[RateLimitTierKey] as string ?? "ip";
++            var partitionId = context.HttpContext.Request.Headers["X-Trim-Userid"].ToString();
++            if (!string.IsNullOrWhiteSpace(partitionId))
++            {
++                partitionId = $"uid:{partitionId.Trim()}";
++            }
++            else if (tier == "session")
++            {
++                partitionId = "session:<fingerprint>";
++            }
++            else
++            {
++                partitionId = $"ip:{context.HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown"}";
++            }
++
++            var retryAfterMinutes = 10;
++            if (context.Lease.TryGetMetadata(System.Threading.RateLimiting.MetadataName.RetryAfter, out var leaseRetryAfter)
++                && leaseRetryAfter is TimeSpan retrySpan)
++            {
++                retryAfterMinutes = Math.Max(1, (int)Math.Ceiling(retrySpan.TotalMinutes));
++            }
++
++            rejectLogger?.LogWarning(
++                "Sign-in throttled (login-throttled): path={Path} partition={Partition} retryAfterMinutes={Minutes}",
++                path, partitionId, retryAfterMinutes);
++
++            var blockedMessage = rejectLocalizer?["LoginRateLimitBlocked", retryAfterMinutes]
++                                 ?? new Microsoft.Extensions.Localization.LocalizedString(
++                                     "LoginRateLimitBlocked", $"Too many attempts. Try again in {retryAfterMinutes} minutes.", false);
++
++            context.HttpContext.Response.Redirect(
++                $"{context.HttpContext.Request.PathBase}/Auth/Blocked?message={Uri.EscapeDataString(blockedMessage.Value)}");
+         }
+         else
+         {
+@@ -992,6 +1162,38 @@ using (var scope = app.Services.CreateScope())
+                 var userLogger = services.GetRequiredService<ILogger<Program>>();
+                 userLogger.LogInformation("Admin user created: {Username} with email {Email}", authOptions.Username, adminEmail);
+             }
++            else
++            {
++                var authLogger = services.GetRequiredService<ILogger<Program>>();
++
++                // The configured password is a BOOTSTRAP value: it is only used to create the account.
++                // A settings page that writes Authentication__Password therefore changes nothing once
++                // the account exists, and the user is left believing they changed their login
++                // password. Make the mismatch loud (and, on request, authoritative).
++                var matchesConfigured = !string.IsNullOrEmpty(adminUser.PasswordHash)
++                                        && userService.VerifyPassword(authOptions.Password, adminUser.PasswordHash);
++
++                if (authOptions.SyncPasswordFromConfig)
++                {
++                    if (!matchesConfigured)
++                    {
++                        adminUser.PasswordHash = userService.HashPassword(authOptions.Password);
++                        await userService.UpdateUserAsync(adminUser);
++                        authLogger.LogWarning(
++                            "Authentication:Password applied to the existing administrator {Username} " +
++                            "(Authentication:SyncPasswordFromConfig=true).", adminUser.Username);
++                    }
++                }
++                else if (!matchesConfigured)
++                {
++                    authLogger.LogWarning(
++                        "Authentication:Password does NOT match the stored password of {Username}. " +
++                        "That key only seeds the account on first start - changing it later has no effect. " +
++                        "Change the password inside the app (Users -> Edit / Change password), or set " +
++                        "Authentication:SyncPasswordFromConfig=true to let the configuration win.",
++                        adminUser.Username);
++                }
++            }
+         }
+ 
+         var initLogger = services.GetRequiredService<ILogger<Program>>();
+@@ -1124,14 +1326,78 @@ app.UseWhen(
+ // Use Forwarded Headers middleware for reverse proxy support
+ app.UseForwardedHeaders();
+ 
+-app.UseHttpsRedirection();
++// ===== fnOS fpk: mount the application under the gateway path prefix ====================
++// The gateway serves the app at /app/<name>/ and forwards that path unchanged, so every
++// generated URL (Url.Action, tag helpers, redirects, cookie paths) has to carry the prefix.
++// UsePathBase does exactly that and is a no-op when the prefix is empty, which keeps local
++// direct-access debugging identical to upstream.
++// Read from configuration (PathBase) or from the environment variable PATH_BASE: the default
++// configuration provider does not map a single-underscore variable onto a configuration key.
++var pathBase = builder.Configuration["PathBase"];
++if (string.IsNullOrWhiteSpace(pathBase))
++{
++    pathBase = Environment.GetEnvironmentVariable("PATH_BASE");
++}
++
++if (!string.IsNullOrWhiteSpace(pathBase))
++{
++    pathBase = pathBase.Trim();
++    if (!pathBase.StartsWith('/'))
++    {
++        pathBase = "/" + pathBase;
++    }
++    pathBase = pathBase.TrimEnd('/');
++
++    if (pathBase.Length > 0)
++    {
++        app.UsePathBase(pathBase);
++    }
++}
++// =======================================================================================
++
++// Behind the fnOS gateway TLS terminates at the gateway and this process is reached over a unix
++// socket, so an https redirect can only end in a dead end or a self-loop (A -> B -> A when the
++// gateway re-issues the plain-http request). Keep the behaviour for TCP deployments only.
++if (string.IsNullOrWhiteSpace(listenUnixSocket))
++{
++    app.UseHttpsRedirection();
++}
++
+ app.UseStaticFiles();
+ var supportedCultures = new[] { "en", "en-GB", "de", "es", "fr", "it", "sl", "nl", "ru", "hu", "pl", "zh", "zh-Hans", "zh-CN", "pt-BR", "ja" };
++
++// fnOS fpk: default UI language. Falls back to "en" (upstream behaviour) when unset, and also
++// when the configured value is not in the supported list — an unsupported default would silently
++// resolve to the same fallback, just less visibly.
++var defaultCulture = builder.Configuration["Localization:DefaultCulture"];
++if (string.IsNullOrWhiteSpace(defaultCulture) || !supportedCultures.Contains(defaultCulture))
++{
++    if (!string.IsNullOrWhiteSpace(defaultCulture))
++    {
++        Console.Error.WriteLine(
++            $"[startup] Localization:DefaultCulture '{defaultCulture}' is not a supported culture; falling back to 'en'.");
++    }
++
++    defaultCulture = "en";
++}
++
+ var localizationOptions = new RequestLocalizationOptions()
+-    .SetDefaultCulture("en")
++    .SetDefaultCulture(defaultCulture)
+     .AddSupportedCultures(supportedCultures)
+     .AddSupportedUICultures(supportedCultures);
+ 
++// fnOS fpk: "installs in Chinese and stays Chinese".
++// SetDefaultCulture only decides the fallback for requests that carry no other signal; the
++// framework default provider chain ALSO contains AcceptLanguageHeaderRequestCultureProvider, so
++// a browser sending "en-US" would silently override the configured default. Dropping that
++// provider is what makes the default authoritative. Cookie stays so the in-page language switcher
++// keeps working, and the query string stays for explicit links.
++localizationOptions.RequestCultureProviders = new List<IRequestCultureProvider>
++{
++    new QueryStringRequestCultureProvider(),
++    new CookieRequestCultureProvider()
++};
++
+ app.UseRequestLocalization(localizationOptions);
+ app.UseRouting();
+ app.UseSession();
+@@ -1139,6 +1405,38 @@ app.UseSession();
+ // Add Rate Limiting Middleware
+ app.UseRateLimiter();
+ 
++// Tier 2 of sign-in throttling: one shared bucket for attempts that carry NO fnOS identity.
++app.Use(async (context, next) =>
++{
++    var path = context.Request.Path.Value ?? string.Empty;
++    var isLoginPost = HttpMethods.IsPost(context.Request.Method)
++                      && path.EndsWith("/Auth/Login", StringComparison.OrdinalIgnoreCase);
++
++    if (isLoginPost && string.IsNullOrWhiteSpace(context.Request.Headers["X-Trim-Userid"].ToString()))
++    {
++        if (!LoginGlobalGate.TryAcquire(out var retryAfterSeconds))
++        {
++            var services = context.RequestServices;
++            var gateLogger = services.GetService<ILogger<Program>>();
++            var gateLocalizer = services.GetService<Microsoft.Extensions.Localization.IStringLocalizer<MailArchiver.SharedResource>>();
++
++            gateLogger?.LogWarning(
++                "Sign-in throttled (login-throttled): path={Path} partition=global-fallback tier=global-fallback retryAfterSeconds={Retry}",
++                path, retryAfterSeconds);
++
++            var minutes = Math.Max(1, (int)Math.Ceiling(retryAfterSeconds / 60.0));
++            var message = gateLocalizer?["LoginRateLimitBlocked", minutes]
++                          ?? new Microsoft.Extensions.Localization.LocalizedString(
++                              "LoginRateLimitBlocked", "Too many sign-in attempts. Please try again later.", false);
++
++            context.Response.Redirect($"{context.Request.PathBase}/Auth/Blocked?message={Uri.EscapeDataString(message.Value)}");
++            return;
++        }
++    }
++
++    await next();
++});
++
+ // Add our custom authentication middleware
+ app.UseAuth();
+ 
+@@ -1207,3 +1505,50 @@ internal static class MBoxImportExitCode
+         return reachedCompletion && failedCount == 0 && skippedMalformedCount == 0 ? 0 : 1;
+     }
+ }
++
++/// <summary>
++/// Process-wide counter for sign-in attempts that carry NO fnOS identity — tier 2 of the throttle.
++///
++/// Tier 1 (the LoginAttempts policy) keys on the uid, or on the browser's antiforgery fingerprint.
++/// That fingerprint is per session and stays stable within one (measured), but dropping cookies
++/// hands out a fresh one — and therefore a fresh bucket — on every attempt. Tier 1 alone therefore
++/// cannot bound an attacker; this shared bucket can (default 60 attempts / 10 minutes).
++///
++/// Requests that DO carry a uid skip it entirely, so a real user is never collateral damage.
++/// In-memory, like the tier-1 limiters: a container restart clears it.
++/// </summary>
++static class LoginGlobalGate
++{
++    private const int DefaultLimit = 60;
++    private static readonly TimeSpan Window = TimeSpan.FromMinutes(10);
++    private static readonly object Sync = new();
++    private static DateTime _windowStart = DateTime.UtcNow;
++    private static int _count;
++
++    public static bool TryAcquire(out int retryAfterSeconds)
++    {
++        var limit = int.TryParse(Environment.GetEnvironmentVariable("LOGIN_GLOBAL_LIMIT"), out var configured) && configured > 0
++            ? configured
++            : DefaultLimit;
++
++        lock (Sync)
++        {
++            var now = DateTime.UtcNow;
++            if (now - _windowStart >= Window)
++            {
++                _windowStart = now;
++                _count = 0;
++            }
++
++            if (_count >= limit)
++            {
++                retryAfterSeconds = (int)Math.Ceiling((Window - (now - _windowStart)).TotalSeconds);
++                return false;
++            }
++
++            _count++;
++            retryAfterSeconds = 0;
++            return true;
++        }
++    }
++}
+diff --git a/Resources/SharedResource.resx b/Resources/SharedResource.resx
+index bcdb57b..b107495 100644
+--- a/Resources/SharedResource.resx
++++ b/Resources/SharedResource.resx
+@@ -3526,4 +3526,124 @@
+   <data name="CurrentPeriod" xml:space="preserve">
+     <value>Now</value>
+   </data>
++  <data name="GatewayBindHintTitle" xml:space="preserve">
++    <value>fnOS account detected</value>
++  </data>
++  <data name="GatewayBindHint" xml:space="preserve">
++    <value>Sign in once with your Mail Archiver account to link it to the fnOS user “{0}”. After that the app opens without asking for a password again.</value>
++  </data>
++  <data name="GatewayBindHintScope" xml:space="preserve">
++    <value>Linking does not change this account's permissions — it keeps exactly the role it already has. Whether that role is administrator or normal user is decided here, not by fnOS.</value>
++  </data>
++  <data name="GatewayBindSucceeded" xml:space="preserve">
++    <value>Linked to the fnOS account. You will not be asked to sign in again.</value>
++  </data>
++  <data name="GatewayBindSkippedTwoFactor" xml:space="preserve">
++    <value>This account has two-factor authentication enabled. Turn it off first, then sign in again to link the fnOS account.</value>
++  </data>
++  <data name="GatewayBindConflict" xml:space="preserve">
++    <value>This account is already linked to a different fnOS user. Remove that link in user management first.</value>
++  </data>
++  <data name="GatewayBindFailed" xml:space="preserve">
++    <value>The fnOS account could not be linked. Please try again or contact an administrator.</value>
++  </data>
++  <data name="GatewayBoundCannotPasswordLogin" xml:space="preserve">
++    <value>This account is linked to fnOS and no longer accepts a password. Use the “continue with fnOS” button below, or open the app from the fnOS desktop.</value>
++  </data>
++  <data name="GatewayBindingSection" xml:space="preserve">
++    <value>fnOS account link</value>
++  </data>
++  <data name="GatewayBoundTo" xml:space="preserve">
++    <value>Linked to:</value>
++  </data>
++  <data name="GatewayBoundBadge" xml:space="preserve">
++    <value>linked</value>
++  </data>
++  <data name="GatewayBoundDescription" xml:space="preserve">
++    <value>While this link exists the account has no password sign-in. Removing the link restores it; an administrator can then set a new password.</value>
++  </data>
++  <data name="GatewayUnbind" xml:space="preserve">
++    <value>Remove link</value>
++  </data>
++  <data name="GatewayUnbindConfirm" xml:space="preserve">
++    <value>Remove the link to this fnOS user? The account will accept a password again.</value>
++  </data>
++  <data name="GatewayUnbindSucceeded" xml:space="preserve">
++    <value>Link removed. This account can sign in with a password again.</value>
++  </data>
++  <data name="GatewayUnbindNoop" xml:space="preserve">
++    <value>There was no fnOS link to remove.</value>
++  </data>
++  <data name="GatewayAccountDisabled" xml:space="preserve">
++    <value>This account has been disabled. Please contact an administrator.</value>
++  </data>
++  <data name="GatewayAccountPendingApproval" xml:space="preserve">
++    <value>This account is waiting for administrator approval.</value>
++  </data>
++  <data name="GatewayBindBlockedBootstrapAdmin" xml:space="preserve">
++    <value>This is the built-in administrator account, so it cannot be linked to fnOS: linking would disable its password and remove the only way back in if single sign-on stops working. Sign in with another administrator account to link it instead.</value>
++  </data>
++  <data name="GatewayAccountRequiresTwoFactor" xml:space="preserve">
++    <value>This account has two-factor authentication enabled, which single sign-on from fnOS cannot satisfy. Remove the fnOS link in user management, or sign in with your password instead.</value>
++  </data>
++  <data name="GatewaySocketNotHardened" xml:space="preserve">
++    <value>Single sign-on is unavailable: the application could not secure its local connection, so it refuses to trust the fnOS identity headers. Check the server logs.</value>
++  </data>
++  <data name="GatewayBindBlockedLastAdmin" xml:space="preserve">
++    <value>This is the last administrator account that can still sign in with a password, so it cannot be linked to fnOS. Add or re-activate another administrator first.</value>
++  </data>
++  <data name="GatewayContinueAs" xml:space="preserve">
++    <value>Continue as “{0}” (fnOS)</value>
++  </data>
++  <data name="GatewayContinueHint" xml:space="preserve">
++    <value>Your fnOS session is still active — this returns to the app without a password.</value>
++  </data>
++  <data name="GatewayLoggedOutNotice" xml:space="preserve">
++    <value>You have signed out of Mail Archiver. Your fnOS session is unaffected.</value>
++  </data>
++  <data name="LoginRateLimitBlocked" xml:space="preserve">
++    <value>Too many sign-in attempts. Please wait {0} minute(s) and try again.</value>
++  </data>
++  <data name="GatewayUnbindBlockedNoPassword" xml:space="preserve">
++    <value>“{0}” has no password, so unlinking it would leave an administrator nobody can sign in as. Set a password for this account first, then remove the link.</value>
++  </data>
++  <data name="GatewayUnbindBlockedLastAdmin" xml:space="preserve">
++    <value>“{0}” is the last administrator that can still sign in with a password. At least one such administrator must remain — set a password on another administrator first, then remove the link.</value>
++  </data>
++  <data name="ConsentTitle" xml:space="preserve">
++    <value>Allow Mail Archiver to use your fnOS identity?</value>
++  </data>
++  <data name="ConsentSubtitle" xml:space="preserve">
++    <value>This happens once. You can decline and still sign in with a Mail Archiver account.</value>
++  </data>
++  <data name="ConsentIdentityLabel" xml:space="preserve">
++    <value>fnOS account</value>
++  </data>
++  <data name="ConsentIdentityValue" xml:space="preserve">
++    <value>“{0}” (uid {1})</value>
++  </data>
++  <data name="ConsentScopeIdentity" xml:space="preserve">
++    <value>Mail Archiver will know WHO you are (your fnOS user name and uid).</value>
++  </data>
++  <data name="ConsentScopeNoData" xml:space="preserve">
++    <value>Nothing else is read: no files, no photos, no other applications.</value>
++  </data>
++  <data name="ConsentScopeNoPassword" xml:space="preserve">
++    <value>Your fnOS password is never seen or stored by Mail Archiver.</value>
++  </data>
++  <data name="ConsentAgree" xml:space="preserve">
++    <value>Allow and continue</value>
++  </data>
++  <data name="ConsentDeny" xml:space="preserve">
++    <value>Decline</value>
++  </data>
++  <data name="ConsentDenyNote" xml:space="preserve">
++    <value>If you decline, no link is created and nothing is stored except your decision. You can still sign in with your Mail Archiver account and password.</value>
++  </data>
++  <data name="ConsentDeniedNotice" xml:space="preserve">
++    <value>You declined the fnOS identity earlier. You can sign in with your Mail Archiver account below, or allow it now.</value>
++  </data>
++  <data name="ConsentReopen" xml:space="preserve">
++    <value>Allow fnOS identity</value>
++  </data>
+ </root>
+diff --git a/Resources/SharedResource.zh.resx b/Resources/SharedResource.zh.resx
+index f316d5f..1eaca0f 100644
+--- a/Resources/SharedResource.zh.resx
++++ b/Resources/SharedResource.zh.resx
+@@ -3502,4 +3502,124 @@
+   <data name="CurrentPeriod" xml:space="preserve">
+     <value>现在</value>
+   </data>
++  <data name="GatewayBindHintTitle" xml:space="preserve">
++    <value>检测到 fnOS 用户</value>
++  </data>
++  <data name="GatewayBindHint" xml:space="preserve">
++    <value>请用你的 Mail Archiver 账号登录一次，即可绑定 fnOS 用户「{0}」。绑定后打开应用不再需要输入密码。</value>
++  </data>
++  <data name="GatewayBindHintScope" xml:space="preserve">
++    <value>绑定不会改变该账号的权限，它仍然是原本的角色。是否管理员由本应用决定，与 fnOS 无关。</value>
++  </data>
++  <data name="GatewayBindSucceeded" xml:space="preserve">
++    <value>已绑定 fnOS 账号，此后打开应用无需再次登录。</value>
++  </data>
++  <data name="GatewayBindSkippedTwoFactor" xml:space="preserve">
++    <value>该账号启用了两步验证，请先关闭两步验证，再登录以绑定 fnOS 账号。</value>
++  </data>
++  <data name="GatewayBindConflict" xml:space="preserve">
++    <value>该账号已绑定其他 fnOS 用户，请先在用户管理中解除原有绑定。</value>
++  </data>
++  <data name="GatewayBindFailed" xml:space="preserve">
++    <value>fnOS 账号绑定失败，请重试或联系管理员。</value>
++  </data>
++  <data name="GatewayBoundCannotPasswordLogin" xml:space="preserve">
++    <value>该账号已绑定 fnOS，不再接受密码登录。请点下方「以…身份继续」，或从 fnOS 桌面重新打开应用。</value>
++  </data>
++  <data name="GatewayBindingSection" xml:space="preserve">
++    <value>fnOS 账号绑定</value>
++  </data>
++  <data name="GatewayBoundTo" xml:space="preserve">
++    <value>已绑定：</value>
++  </data>
++  <data name="GatewayBoundBadge" xml:space="preserve">
++    <value>已绑定</value>
++  </data>
++  <data name="GatewayBoundDescription" xml:space="preserve">
++    <value>绑定期间该账号没有密码登录能力。解除绑定后会恢复，管理员可随后为其设置新密码。</value>
++  </data>
++  <data name="GatewayUnbind" xml:space="preserve">
++    <value>解除绑定</value>
++  </data>
++  <data name="GatewayUnbindConfirm" xml:space="preserve">
++    <value>确定解除与该 fnOS 用户的绑定？解除后该账号将重新可用密码登录。</value>
++  </data>
++  <data name="GatewayUnbindSucceeded" xml:space="preserve">
++    <value>已解除绑定，该账号可重新使用密码登录。</value>
++  </data>
++  <data name="GatewayUnbindNoop" xml:space="preserve">
++    <value>该账号当前没有绑定关系。</value>
++  </data>
++  <data name="GatewayAccountDisabled" xml:space="preserve">
++    <value>该账号已被停用，请联系管理员。</value>
++  </data>
++  <data name="GatewayAccountPendingApproval" xml:space="preserve">
++    <value>该账号正在等待管理员审批。</value>
++  </data>
++  <data name="GatewayBindBlockedBootstrapAdmin" xml:space="preserve">
++    <value>这是内置管理员账号，不能与 fnOS 绑定：绑定会停用它的密码登录，一旦单点登录失效就没有任何办法重新进入。请改用其他管理员账号登录后再绑定。</value>
++  </data>
++  <data name="GatewayAccountRequiresTwoFactor" xml:space="preserve">
++    <value>该账号已启用两步验证，fnOS 免密登录无法完成第二步验证。请在用户管理中解除 fnOS 绑定，或改用密码登录。</value>
++  </data>
++  <data name="GatewaySocketNotHardened" xml:space="preserve">
++    <value>单点登录暂不可用：应用无法保护本地连接，因此拒绝信任 fnOS 身份头。请查看服务器日志。</value>
++  </data>
++  <data name="GatewayBindBlockedLastAdmin" xml:space="preserve">
++    <value>这是最后一个仍可用密码登录的管理员账号，不能与 fnOS 绑定。请先新增或重新启用另一个管理员。</value>
++  </data>
++  <data name="GatewayContinueAs" xml:space="preserve">
++    <value>以「{0}」身份继续（fnOS 免密）</value>
++  </data>
++  <data name="GatewayContinueHint" xml:space="preserve">
++    <value>你的 fnOS 登录仍然有效，点击即可免密返回应用。</value>
++  </data>
++  <data name="GatewayLoggedOutNotice" xml:space="preserve">
++    <value>已退出 Mail Archiver，fnOS 登录状态不受影响。</value>
++  </data>
++  <data name="LoginRateLimitBlocked" xml:space="preserve">
++    <value>登录尝试过于频繁，请在 {0} 分钟后重试。</value>
++  </data>
++  <data name="GatewayUnbindBlockedNoPassword" xml:space="preserve">
++    <value>「{0}」尚未设置密码，解除绑定后该管理员将无法登录。请先为该账号设置密码，再解除绑定。</value>
++  </data>
++  <data name="GatewayUnbindBlockedLastAdmin" xml:space="preserve">
++    <value>「{0}」是最后一个仍可用密码登录的管理员，必须至少保留一个。请先为另一位管理员设置密码，再解除此绑定。</value>
++  </data>
++  <data name="ConsentTitle" xml:space="preserve">
++    <value>允许 Mail-Archiver 使用你的 fnOS 身份？</value>
++  </data>
++  <data name="ConsentSubtitle" xml:space="preserve">
++    <value>只需确认一次。你也可以拒绝，之后仍可用 Mail-Archiver 账号密码登录。</value>
++  </data>
++  <data name="ConsentIdentityLabel" xml:space="preserve">
++    <value>fnOS 账号</value>
++  </data>
++  <data name="ConsentIdentityValue" xml:space="preserve">
++    <value>「{0}」（uid {1}）</value>
++  </data>
++  <data name="ConsentScopeIdentity" xml:space="preserve">
++    <value>Mail-Archiver 将获知你是谁（fnOS 用户名与 uid）。</value>
++  </data>
++  <data name="ConsentScopeNoData" xml:space="preserve">
++    <value>不会读取其他任何内容：不读文件、不读相册、不访问其他应用。</value>
++  </data>
++  <data name="ConsentScopeNoPassword" xml:space="preserve">
++    <value>Mail-Archiver 不会看到也不会保存你的 fnOS 密码。</value>
++  </data>
++  <data name="ConsentAgree" xml:space="preserve">
++    <value>同意并继续</value>
++  </data>
++  <data name="ConsentDeny" xml:space="preserve">
++    <value>拒绝</value>
++  </data>
++  <data name="ConsentDenyNote" xml:space="preserve">
++    <value>若拒绝，不会建立任何绑定，只记录你的选择。你仍可用 Mail-Archiver 账号密码登录。</value>
++  </data>
++  <data name="ConsentDeniedNotice" xml:space="preserve">
++    <value>你此前拒绝了使用 fnOS 身份登录。可在下方用 Mail-Archiver 账号密码登录，或现在允许。</value>
++  </data>
++  <data name="ConsentReopen" xml:space="preserve">
++    <value>允许使用 fnOS 身份</value>
++  </data>
+ </root>
+\ No newline at end of file
+diff --git a/Services/IAuthenticationService.cs b/Services/IAuthenticationService.cs
+index 84eeed0..755c991 100644
+--- a/Services/IAuthenticationService.cs
++++ b/Services/IAuthenticationService.cs
+@@ -1,4 +1,5 @@
+ using MailArchiver.Models;
++using System.Security.Claims;
+ namespace MailArchiver.Services
+ {
+     public interface IAuthenticationService
+@@ -11,5 +12,15 @@ namespace MailArchiver.Services
+         int? GetCurrentUserId(HttpContext context);
+         bool IsCurrentUserAdmin(HttpContext context);
+         bool IsCurrentUserSelfManager(HttpContext context);
++
++        /// <summary>
++        /// Builds the claims principal for a local account (single source of truth for the claim
++        /// shape). <paramref name="gatewaySubject"/> is stamped as a claim when the session was
++        /// issued by the fnOS gateway bridge; leave it null for password sessions.
++        /// </summary>
++        ClaimsPrincipal BuildPrincipal(User user, string? gatewaySubject = null);
++
++        /// <summary>Session lifetime in minutes (<c>Authentication:SessionTimeoutMinutes</c>).</summary>
++        int GetSessionTimeoutMinutes();
+     }
+ }
+diff --git a/Services/IUserService.cs b/Services/IUserService.cs
+index f4d2099..11e57d1 100644
+--- a/Services/IUserService.cs
++++ b/Services/IUserService.cs
+@@ -31,5 +31,13 @@ namespace MailArchiver.Services
+         Task<string?> GetTwoFactorSecretAsync(int userId);
+         Task<bool> VerifyTwoFactorBackupCodeAsync(int userId, string backupCode);
+         Task<bool> RemoveUsedBackupCodeAsync(int userId, string usedCode);
++
++        // fnOS gateway identity link ("1:1 account binding").
++        // The external subject is stored in the existing OAuthRemoteUserId column with the
++        // "fnos:" prefix, so no schema migration is required.
++        Task<User?> GetUserByGatewaySubjectAsync(string subject);
++        Task<GatewayBindResult> TryBindGatewaySubjectAsync(int userId, string subject);
++        Task<GatewayUnbindOutcome> UnbindGatewaySubjectAsync(int userId);
++        Task TouchLastLoginAsync(int userId);
+     }
+ }
+diff --git a/Services/SocketSecurityState.cs b/Services/SocketSecurityState.cs
+new file mode 100644
+index 0000000..92dec4c
+--- /dev/null
++++ b/Services/SocketSecurityState.cs
+@@ -0,0 +1,51 @@
++namespace MailArchiver.Services
++{
++    /// <summary>
++    /// Runtime state of the unix-socket hardening.
++    ///
++    /// Why this exists: when the app listens on a unix socket, the socket's file mode is the ONLY
++    /// trust boundary for the identity headers injected by the fnOS gateway. If the socket cannot
++    /// be tightened to owner-only, the gateway bridge must stop trusting those headers instead of
++    /// silently continuing — "any local process can become any user" is not an acceptable
++    /// degradation.
++    ///
++    /// The state is recoverable: <see cref="UnixSocketPermissionService"/> keeps retrying and flips
++    /// this back to hardened as soon as it succeeds, so a permission problem fixed on the host does
++    /// not require restarting the container.
++    ///
++    /// Registered as a singleton; all fields are volatile because the writer is a background
++    /// service and the readers are request threads.
++    /// </summary>
++    public class SocketSecurityState
++    {
++        private volatile bool _hardened;
++        private volatile bool _hardeningFailed;
++        private volatile string? _socketPath;
++
++        /// <summary>True once the socket mode has been confirmed as owner-only (0600).</summary>
++        public bool IsHardened => _hardened;
++
++        /// <summary>
++        /// True when tightening was attempted and failed. The gateway bridge treats this as
++        /// fail-closed: it refuses to authenticate from headers rather than run unprotected.
++        /// Cleared automatically when a later retry succeeds.
++        /// </summary>
++        public bool HardeningFailed => _hardeningFailed;
++
++        public string? SocketPath => _socketPath;
++
++        public void MarkHardened(string socketPath)
++        {
++            _socketPath = socketPath;
++            _hardened = true;
++            _hardeningFailed = false;
++        }
++
++        public void MarkFailed(string socketPath)
++        {
++            _socketPath = socketPath;
++            _hardened = false;
++            _hardeningFailed = true;
++        }
++    }
++}
+diff --git a/Services/UnixSocketPermissionService.cs b/Services/UnixSocketPermissionService.cs
+new file mode 100644
+index 0000000..6f38114
+--- /dev/null
++++ b/Services/UnixSocketPermissionService.cs
+@@ -0,0 +1,154 @@
++namespace MailArchiver.Services
++{
++    /// <summary>
++    /// Keeps the Kestrel unix domain socket at <c>0600</c> and records the outcome in
++    /// <see cref="SocketSecurityState"/>.
++    ///
++    /// Why this matters: the fnOS gateway injects the caller's identity as HTTP headers and the
++    /// application trusts them. The socket's file mode is the only thing between those headers and
++    /// any other local process. Two layers are used:
++    ///   1. the container entrypoint runs with <c>umask 0077</c>, so the socket is created
++    ///      owner-only (0666 &amp; ~0077 = 0600) while directories stay traversable (0700);
++    ///   2. this service re-applies the mode and keeps watching.
++    ///
++    /// Failure is NOT terminal and NOT silent:
++    ///   * the gateway bridge stops trusting headers while the state is failed (fail-closed);
++    ///   * this loop keeps retrying, so fixing the permissions on the host clears the condition
++    ///     without restarting the container;
++    ///   * a failure is logged at Error once, repeats at Debug, and recovery at Information, so a
++    ///     broken deployment does not flood the log.
++    /// </summary>
++    public class UnixSocketPermissionService : BackgroundService
++    {
++        /// <summary>Retry cadence while the socket is unhealthy or missing.</summary>
++        private static readonly TimeSpan RetryInterval = TimeSpan.FromSeconds(2);
++
++        /// <summary>Re-check cadence once the socket is known good (cheap, no log noise).</summary>
++        private static readonly TimeSpan HealthyInterval = TimeSpan.FromSeconds(30);
++
++        /// <summary>
++        /// Grace period before "socket still has not appeared" is escalated to a failure. Kestrel
++        /// binds shortly after start-up; a slow disk can take a few seconds. Retrying continues, so
++        /// the escalation is reversible.
++        /// </summary>
++        private static readonly TimeSpan AppearanceGrace = TimeSpan.FromSeconds(30);
++
++        private readonly string _socketPath;
++        private readonly SocketSecurityState _state;
++        private readonly ILogger<UnixSocketPermissionService> _logger;
++
++        private bool _failureReported;
++
++        public UnixSocketPermissionService(
++            string socketPath,
++            SocketSecurityState state,
++            ILogger<UnixSocketPermissionService> logger)
++        {
++            _socketPath = socketPath;
++            _state = state;
++            _logger = logger;
++        }
++
++        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
++        {
++            if (!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS() && !OperatingSystem.IsFreeBSD())
++            {
++                return;
++            }
++
++            var startedAt = DateTime.UtcNow;
++
++            while (!stoppingToken.IsCancellationRequested)
++            {
++                var wasHardened = _state.IsHardened;
++
++                try
++                {
++                    File.SetUnixFileMode(
++                        _socketPath,
++                        UnixFileMode.UserRead | UnixFileMode.UserWrite);
++
++                    _state.MarkHardened(_socketPath);
++
++                    if (!wasHardened)
++                    {
++                        if (_failureReported)
++                        {
++                            _logger.LogInformation(
++                                "Unix socket '{SocketPath}' is owner-only (0600) again. " +
++                                "Gateway header authentication has been re-enabled (no restart needed).",
++                                _socketPath);
++                        }
++                        else
++                        {
++                            _logger.LogInformation(
++                                "Unix socket '{SocketPath}' is owner-only (0600) — gateway headers will be trusted.",
++                                _socketPath);
++                        }
++                    }
++
++                    _failureReported = false;
++                    await DelayAsync(HealthyInterval, stoppingToken);
++                    continue;
++                }
++                catch (OperationCanceledException)
++                {
++                    return;
++                }
++                catch (FileNotFoundException)
++                {
++                    if (DateTime.UtcNow - startedAt > AppearanceGrace)
++                    {
++                        ReportFailure("it has not appeared yet");
++                    }
++                }
++                catch (DirectoryNotFoundException)
++                {
++                    if (DateTime.UtcNow - startedAt > AppearanceGrace)
++                    {
++                        ReportFailure("its parent directory does not exist");
++                    }
++                }
++                catch (Exception ex)
++                {
++                    ReportFailure(ex.Message);
++                }
++
++                await DelayAsync(RetryInterval, stoppingToken);
++            }
++        }
++
++        private void ReportFailure(string reason)
++        {
++            _state.MarkFailed(_socketPath);
++
++            if (_failureReported)
++            {
++                _logger.LogDebug(
++                    "Unix socket '{SocketPath}' is still not owner-only ({Reason}); still retrying.",
++                    _socketPath, reason);
++                return;
++            }
++
++            _failureReported = true;
++            _logger.LogError(
++                "Could not restrict unix socket '{SocketPath}' to 0600 ({Reason}). " +
++                "Gateway header authentication is REFUSED (fail-closed) until this is fixed. " +
++                "The check retries every {Seconds}s and recovers by itself once the permissions " +
++                "can be set — no restart required. Password sign-in on /Auth/Login is unaffected.",
++                _socketPath, reason, (int)RetryInterval.TotalSeconds);
++        }
++
++        private static async Task DelayAsync(TimeSpan delay, CancellationToken stoppingToken)
++        {
++            try
++            {
++                await Task.Delay(delay, stoppingToken);
++            }
++            catch (OperationCanceledException)
++            {
++                // Shutting down: swallow so the loop can exit cleanly.
++            }
++        }
++    }
++}
+diff --git a/Services/UserService.cs b/Services/UserService.cs
+index 4c0cca7..0b95e23 100644
+--- a/Services/UserService.cs
++++ b/Services/UserService.cs
+@@ -668,5 +668,187 @@ namespace MailArchiver.Services
+         }
+ 
+         #endregion
++
++        #region fnOS gateway identity link
++
++        /// <summary>
++        /// Finds the local account linked to an fnOS gateway subject.
++        /// </summary>
++        public async Task<User?> GetUserByGatewaySubjectAsync(string subject)
++        {
++            if (string.IsNullOrWhiteSpace(subject))
++            {
++                return null;
++            }
++
++            return await _context.Users
++                .AsNoTracking()
++                .FirstOrDefaultAsync(u => u.OAuthRemoteUserId == subject);
++        }
++
++        /// <summary>
++        /// Links an fnOS subject to an existing local account (1:1).
++        ///
++        /// Written as a single-column, conditionally-applied UPDATE rather than a full entity
++        /// update, for three reasons: it cannot clobber unrelated fields being edited elsewhere;
++        /// the <c>WHERE OAuthRemoteUserId IS NULL</c> guard makes concurrent linking safe; and the
++        /// unique filtered index on that column turns a double-link race into a database error we
++        /// translate into a readable result instead of a 500.
++        ///
++        /// Note: this only writes the link. IsActive / RequiresApproval / IsAdmin are deliberately
++        /// left untouched — granting privileges is the administrator's decision, not the gateway's.
++        /// </summary>
++        public async Task<GatewayBindResult> TryBindGatewaySubjectAsync(int userId, string subject)
++        {
++            if (string.IsNullOrWhiteSpace(subject))
++            {
++                return GatewayBindResult.InvalidSubject;
++            }
++
++            var user = await _context.Users.AsNoTracking().FirstOrDefaultAsync(u => u.Id == userId);
++            if (user == null)
++            {
++                return GatewayBindResult.UserNotFound;
++            }
++
++            if (!string.IsNullOrEmpty(user.OAuthRemoteUserId))
++            {
++                return user.OAuthRemoteUserId == subject
++                    ? GatewayBindResult.AlreadyBoundToSame
++                    : GatewayBindResult.AccountAlreadyBound;
++            }
++
++            var subjectHolder = await _context.Users.AsNoTracking()
++                .FirstOrDefaultAsync(u => u.OAuthRemoteUserId == subject);
++            if (subjectHolder != null)
++            {
++                return subjectHolder.Id == userId
++                    ? GatewayBindResult.AlreadyBoundToSame
++                    : GatewayBindResult.SubjectAlreadyBound;
++            }
++
++            try
++            {
++                var affected = await _context.Users
++                    .Where(u => u.Id == userId && (u.OAuthRemoteUserId == null || u.OAuthRemoteUserId == ""))
++                    .ExecuteUpdateAsync(setters => setters.SetProperty(u => u.OAuthRemoteUserId, subject));
++
++                if (affected > 0)
++                {
++                    _logger.LogInformation(
++                        "Linked fnOS subject {Subject} to user {Username} (ID: {UserId}).",
++                        subject, user.Username, user.Id);
++                    return GatewayBindResult.Success;
++                }
++
++                // Lost the race: somebody linked this account between our read and our write.
++                return GatewayBindResult.AccountAlreadyBound;
++            }
++            catch (Exception ex) when (IsUniqueViolation(ex))
++            {
++                _logger.LogWarning(
++                    "Link of fnOS subject {Subject} to user (ID: {UserId}) hit a unique constraint; treating as already linked.",
++                    subject, userId);
++                return GatewayBindResult.AccountAlreadyBound;
++            }
++        }
++
++        /// <summary>
++        /// Removes the fnOS link from an account. Clearing the column is all that is needed:
++        /// every "external account" restriction in the codebase is expressed as
++        /// <c>!string.IsNullOrEmpty(OAuthRemoteUserId)</c>, so password sign-in, password changes
++        /// and 2FA automatically become available again.
++        /// </summary>
++        public async Task<GatewayUnbindOutcome> UnbindGatewaySubjectAsync(int userId)
++        {
++            var user = await _context.Users.AsNoTracking().FirstOrDefaultAsync(u => u.Id == userId);
++            if (user == null)
++            {
++                return GatewayUnbindOutcome.UserNotFound;
++            }
++
++            if (string.IsNullOrEmpty(user.OAuthRemoteUserId))
++            {
++                return GatewayUnbindOutcome.NotLinked;
++            }
++
++            // Guard: unlinking re-enables the password channel, so it never removes a reachable
++            // administrator — unless this account has no password at all. Unlinking such an account
++            // would leave an administrator that nobody can sign in as, which is exactly the
++            // "unlinked everything and can never get back in" state this guard exists to prevent.
++            if (user.IsAdmin && string.IsNullOrEmpty(user.PasswordHash))
++            {
++                _logger.LogWarning(
++                    "Refused to unlink fnOS subject {Subject} from administrator {Username} (ID: {UserId}): " +
++                    "the account has no password, so it could not sign in afterwards.",
++                    user.OAuthRemoteUserId, user.Username, user.Id);
++                return GatewayUnbindOutcome.AdministratorWithoutPassword;
++            }
++
++            // Guard: never leave the installation without an administrator that has a usable
++            // password. Computed for the state *after* this unlink would have been applied.
++            if (user.IsAdmin)
++            {
++                var reachableAdminsAfter = await _context.Users
++                    .CountAsync(u => u.IsAdmin && u.IsActive && u.PasswordHash != null && u.Id != userId);
++
++                if (reachableAdminsAfter == 0)
++                {
++                    _logger.LogWarning(
++                        "Refused to unlink fnOS subject {Subject} from administrator {Username} (ID: {UserId}): " +
++                        "it is the last administrator that can still sign in with a password.",
++                        user.OAuthRemoteUserId, user.Username, user.Id);
++                    return GatewayUnbindOutcome.LastReachableAdministrator;
++                }
++            }
++
++            var affected = await _context.Users
++                .Where(u => u.Id == userId && u.OAuthRemoteUserId != null)
++                .ExecuteUpdateAsync(setters => setters.SetProperty(u => u.OAuthRemoteUserId, (string?)null));
++
++            if (affected > 0)
++            {
++                _logger.LogInformation("Removed fnOS link from user ID {UserId}.", userId);
++                return GatewayUnbindOutcome.Success;
++            }
++
++            return GatewayUnbindOutcome.NotLinked;
++        }
++
++        /// <summary>
++        /// Stamps the last-login time with a targeted UPDATE (no full-entity rewrite).
++        /// </summary>
++        public async Task TouchLastLoginAsync(int userId)
++        {
++            try
++            {
++                await _context.Users
++                    .Where(u => u.Id == userId)
++                    .ExecuteUpdateAsync(setters => setters.SetProperty(u => u.LastLoginAt, DateTime.UtcNow));
++            }
++            catch (Exception ex)
++            {
++                // Never fail a sign-in because a timestamp could not be written.
++                _logger.LogWarning(ex, "Could not update LastLoginAt for user ID {UserId}.", userId);
++            }
++        }
++
++        /// <summary>
++        /// Detects a PostgreSQL unique-constraint violation (SQLSTATE 23505), possibly wrapped.
++        /// </summary>
++        private static bool IsUniqueViolation(Exception ex)
++        {
++            for (var current = ex; current != null; current = current.InnerException)
++            {
++                if (current is Npgsql.PostgresException pg && pg.SqlState == "23505")
++                {
++                    return true;
++                }
++            }
++
++            return false;
++        }
++
++        #endregion
+     }
+ }
+diff --git a/Views/Auth/Consent.cshtml b/Views/Auth/Consent.cshtml
+new file mode 100644
+index 0000000..0393621
+--- /dev/null
++++ b/Views/Auth/Consent.cshtml
+@@ -0,0 +1,48 @@
++@inject Microsoft.Extensions.Localization.IStringLocalizer<MailArchiver.SharedResource> Localizer
++@{
++    ViewData["Title"] = Localizer["ConsentTitle"];
++    Layout = "_LoginLayout";
++    var userName = ViewBag.ConsentUserName as string ?? "";
++    var uid = ViewBag.ConsentUid as string ?? "";
++    var returnUrl = ViewBag.ConsentReturnUrl as string ?? "/";
++}
++<div class="login-container">
++    <div class="card login-card">
++        <div class="card-body">
++            <div class="text-center mb-4">
++                <i class="bi bi-shield-lock display-3 text-primary"></i>
++                <h2 class="mt-3">@Localizer["ConsentTitle"]</h2>
++                <p class="text-muted mb-0">@Localizer["ConsentSubtitle"]</p>
++            </div>
++
++            <div class="alert alert-info" role="alert">
++                <div class="fw-semibold mb-1">@Localizer["ConsentIdentityLabel"]</div>
++                <div>@Localizer["ConsentIdentityValue", userName, uid]</div>
++            </div>
++
++            <ul class="list-unstyled small mb-4">
++                <li class="mb-2"><i class="bi bi-check-circle-fill text-success me-2"></i>@Localizer["ConsentScopeIdentity"]</li>
++                <li class="mb-2"><i class="bi bi-check-circle-fill text-success me-2"></i>@Localizer["ConsentScopeNoData"]</li>
++                <li class="mb-2"><i class="bi bi-x-circle-fill text-danger me-2"></i>@Localizer["ConsentScopeNoPassword"]</li>
++            </ul>
++
++            <form asp-action="ConsentDecision" method="post" class="d-grid gap-2">
++                <input type="hidden" name="returnUrl" value="@returnUrl" />
++                <input type="hidden" name="decision" value="allow" />
++                <button type="submit" class="btn btn-primary btn-lg">
++                    <i class="bi bi-check-lg me-2"></i>@Localizer["ConsentAgree"]
++                </button>
++            </form>
++
++            <form asp-action="ConsentDecision" method="post" class="d-grid gap-2 mt-2">
++                <input type="hidden" name="returnUrl" value="@returnUrl" />
++                <input type="hidden" name="decision" value="deny" />
++                <button type="submit" class="btn btn-outline-secondary">
++                    <i class="bi bi-x-lg me-2"></i>@Localizer["ConsentDeny"]
++                </button>
++            </form>
++
++            <p class="text-muted small mb-0 mt-3 text-center">@Localizer["ConsentDenyNote"]</p>
++        </div>
++    </div>
++</div>
+diff --git a/Views/Auth/Login.cshtml b/Views/Auth/Login.cshtml
+index d1f5c54..efccb83 100644
+--- a/Views/Auth/Login.cshtml
++++ b/Views/Auth/Login.cshtml
+@@ -22,7 +22,59 @@
+                     <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                 </div>
+             }
+-            
++
++            @* fnOS gateway: outcome of the one-time account link performed by the POST handler. *@
++            @if (TempData["SuccessMessage"] is string gatewaySuccessMessage && !string.IsNullOrEmpty(gatewaySuccessMessage))
++            {
++                <div class="alert alert-success" role="alert">@gatewaySuccessMessage</div>
++            }
++            @if (TempData["WarningMessage"] is string gatewayWarningMessage && !string.IsNullOrEmpty(gatewayWarningMessage))
++            {
++                <div class="alert alert-warning" role="alert">@gatewayWarningMessage</div>
++            }
++
++            @* fnOS gateway: the request carries an fnOS identity that is not linked yet. Signing in
++               once links it; the note explains the consequence so the link is a deliberate choice. *@
++            @if (ViewBag.GatewayBindUsername != null)
++            {
++                <div class="alert alert-info" role="alert">
++                    <div class="fw-semibold mb-1">
++                        <i class="bi bi-link-45deg me-1"></i>@Localizer["GatewayBindHintTitle"]
++                    </div>
++                    <div>@Localizer["GatewayBindHint", (string)ViewBag.GatewayBindUsername]</div>
++                    <div class="small text-muted mt-2">@Localizer["GatewayBindHintScope"]</div>
++                </div>
++            }
++
++            @* Signed-out notice: the fnOS session is untouched, so getting back in is one click. *@
++            @if (Context.Request.Query["loggedOut"] == "1")
++            {
++                <div class="alert alert-secondary py-2" role="status">@Localizer["GatewayLoggedOutNotice"]</div>
++            }
++
++            @* The user declined the fnOS identity earlier. Say so, and offer a one-click way back. *@
++            @if (Context.Request.Query["consent"] == "denied")
++            {
++                <div class="alert alert-warning py-2" role="status">
++                    @Localizer["ConsentDeniedNotice"]
++                    <a class="alert-link" asp-action="Consent" asp-route-reset="1"
++                       asp-route-returnUrl="@ViewData["ReturnUrl"]">@Localizer["ConsentReopen"]</a>
++                </div>
++            }
++
++            @* Passwordless way back in. Shown whenever the request carries a linked fnOS identity —
++               the password form cannot work for such an account, so this must never be a dead end. *@
++            @if (ViewBag.GatewayContinueSubject != null)
++            {
++                <form asp-action="GatewayContinue" method="post" class="mb-3">
++                    <input type="hidden" name="returnUrl" value="@ViewData["ReturnUrl"]" />
++                    <button type="submit" class="btn btn-primary btn-lg w-100">
++                        <i class="bi bi-person-badge me-2"></i>@Localizer["GatewayContinueAs", (string)ViewBag.GatewayContinueSubject]
++                    </button>
++                    <div class="form-text text-center mt-2">@Localizer["GatewayContinueHint"]</div>
++                </form>
++            }
++
+             @if (!disablePasswordLogin)
+             {
+                 <form asp-action="Login" method="post">
+diff --git a/Views/MailAccounts/AuthorizeMsaDevice.cshtml b/Views/MailAccounts/AuthorizeMsaDevice.cshtml
+index 049fa27..9189953 100644
+--- a/Views/MailAccounts/AuthorizeMsaDevice.cshtml
++++ b/Views/MailAccounts/AuthorizeMsaDevice.cshtml
+@@ -116,7 +116,7 @@
+                 // may have already authorized on the Microsoft page.
+                 const safeMsg = document.createElement('span');
+                 safeMsg.textContent = data.message;
+-                setStatus('danger', `<i class="bi bi-x-circle-fill me-2"></i><strong>${errorPrefix}</strong> ${safeMsg.innerHTML} &nbsp;<a href="/MailAccounts/AuthorizeMsaDevice/${accountId}" class="btn btn-sm btn-outline-danger ms-2">${retryLabel}</a>`);
++                setStatus('danger', `<i class="bi bi-x-circle-fill me-2"></i><strong>${errorPrefix}</strong> ${safeMsg.innerHTML} &nbsp;<a href="${window.__appBase}/MailAccounts/AuthorizeMsaDevice/${accountId}" class="btn btn-sm btn-outline-danger ms-2">${retryLabel}</a>`);
+                 return;
+             }
+             // pending — keep the waiting message visible and continue polling.
+diff --git a/Views/Shared/_Layout.cshtml b/Views/Shared/_Layout.cshtml
+index 1cf290f..5db1c68 100644
+--- a/Views/Shared/_Layout.cshtml
++++ b/Views/Shared/_Layout.cshtml
+@@ -8,6 +8,10 @@
+ <head>
+     <meta charset="utf-8" />
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
++    @* PathBase for client-side code. When the app is mounted under the fnOS gateway
++       (/app/<name>/) a handful of hand-written fetch() URLs need the prefix; everything else is
++       generated server-side and already carries it. *@
++    <script>window.__appBase = '@Context.Request.PathBase';</script>
+     <script>
+         (function() {
+             var t = localStorage.getItem('theme');
+@@ -290,7 +294,7 @@
+                 var dismissBtn = document.getElementById('dismissChangelogBtn');
+ 
+                 function dismissVersion() {
+-                    fetch('/Home/DismissVersion', {
++                    fetch(window.__appBase + '/Home/DismissVersion', {
+                         method: 'POST',
+                         headers: {
+                             'Content-Type': 'application/json',
+@@ -308,7 +312,7 @@
+                 }
+ 
+                 document.addEventListener('DOMContentLoaded', function () {
+-                    fetch('/Home/GetReleaseNotes')
++                    fetch(window.__appBase + '/Home/GetReleaseNotes')
+                         .then(function (r) { return r.json(); })
+                         .then(function (data) {
+                             if (!data || !data.show) return;
+diff --git a/Views/Shared/_LoginLayout.cshtml b/Views/Shared/_LoginLayout.cshtml
+index fa87408..d22b764 100644
+--- a/Views/Shared/_LoginLayout.cshtml
++++ b/Views/Shared/_LoginLayout.cshtml
+@@ -1,5 +1,5 @@
+ ﻿<!DOCTYPE html>
+-<html lang="en">
++<html lang="@System.Globalization.CultureInfo.CurrentUICulture.Name">
+ <head>
+     <meta charset="utf-8" />
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+diff --git a/Views/Shared/_UserInfo.cshtml b/Views/Shared/_UserInfo.cshtml
+index 0e0e540..eafa8a8 100644
+--- a/Views/Shared/_UserInfo.cshtml
++++ b/Views/Shared/_UserInfo.cshtml
+@@ -55,7 +55,7 @@
+         }
+         <li><hr class="dropdown-divider"></li>
+ <li class="px-3 py-2">
+-            <form method="post" action="/Localization/SetLanguage">
++            <form method="post" asp-controller="Localization" asp-action="SetLanguage">
+                 <input type="hidden" name="returnUrl" value="@Context.Request.Path@Context.Request.QueryString" />
+                 <div class="mb-2">
+                     <label class="form-label small text-muted mb-1">@Localizer["Language"]</label>
+diff --git a/Views/Users/Edit.cshtml b/Views/Users/Edit.cshtml
+index 0841e35..5fea488 100644
+--- a/Views/Users/Edit.cshtml
++++ b/Views/Users/Edit.cshtml
+@@ -137,6 +137,30 @@
+                     </form>
+                 </div>
+             }
++
++            @* fnOS link ("1:1 account binding"): read-only display plus an unlink action.
++               The button lives in its own form — nested forms are invalid HTML and would break
++               the main edit form. *@
++            @if (ViewBag.GatewaySubject != null)
++            {
++                <div class="form-section mt-4">
++                    <div class="form-section-header">
++                        <i class="bi bi-link-45deg me-1"></i> @Localizer["GatewayBindingSection"]
++                    </div>
++                    <p class="mb-1">
++                        @Localizer["GatewayBoundTo"] <code>@ViewBag.GatewaySubject</code>
++                        <span class="badge bg-success ms-1">@Localizer["GatewayBoundBadge"]</span>
++                    </p>
++                    <p class="text-muted small">@Localizer["GatewayBoundDescription"]</p>
++                    <form asp-action="UnbindGateway" method="post" class="d-inline">
++                        <input type="hidden" name="id" value="@Model.Id" />
++                        <button type="submit" class="btn btn-outline-warning"
++                                onclick="return confirm('@Localizer["GatewayUnbindConfirm"]')">
++                            <i class="bi bi-x-circle"></i> @Localizer["GatewayUnbind"]
++                        </button>
++                    </form>
++                </div>
++            }
+         </div>
+     </div>
+ </div>
+diff --git a/tests/MailArchiver.Tests/Auth/GatewayAuthMiddlewareSocketTests.cs b/tests/MailArchiver.Tests/Auth/GatewayAuthMiddlewareSocketTests.cs
+new file mode 100644
+index 0000000..c12e020
+--- /dev/null
++++ b/tests/MailArchiver.Tests/Auth/GatewayAuthMiddlewareSocketTests.cs
+@@ -0,0 +1,233 @@
++using System.Security.Claims;
++using MailArchiver.Auth.Middlewares;
++using MailArchiver.Auth.Options;
++using MailArchiver.Models;
++using MailArchiver.Services;
++using Microsoft.AspNetCore.Authentication;
++using Microsoft.AspNetCore.Http;
++using Microsoft.AspNetCore.Http.Features;
++using Microsoft.Extensions.Localization;
++using Microsoft.Extensions.Logging.Abstractions;
++using Microsoft.Extensions.DependencyInjection;
++using Microsoft.Extensions.Options;
++using Xunit;
++
++namespace MailArchiver.Tests.Auth;
++
++/// <summary>
++/// Tests for the fail-closed behaviour of <see cref="GatewayAuthMiddleware"/> when the unix socket
++/// could not be restricted to the owner.
++///
++/// Context: the socket file mode is the only trust boundary for the identity headers injected by
++/// the fnOS gateway. <see cref="SocketSecurityState.HardeningFailed"/> is public and the middleware
++/// is an ordinary middleware, so the wiring can be verified here without adding any test hook to
++/// production code.
++///
++/// The requirement pinned down here is that the gate must be NARROW: a failed hardening refuses
++/// header-authenticated requests, but must NOT block requests that carry no identity header —
++/// otherwise a fixable permission problem would also take down password sign-in and leave the
++/// operator with no way back in.
++/// </summary>
++public class GatewayAuthMiddlewareSocketTests
++{
++    private sealed class PassthroughLocalizer : IStringLocalizer<SharedResource>
++    {
++        public LocalizedString this[string name] => new(name, name, resourceNotFound: false);
++
++        public LocalizedString this[string name, params object[] arguments] =>
++            new(name, string.Format(name, arguments), resourceNotFound: false);
++
++        public IEnumerable<LocalizedString> GetAllStrings(bool includeParentCultures) =>
++            Array.Empty<LocalizedString>();
++    }
++
++    /// <summary>
++    /// Only <see cref="GetUserByGatewaySubjectAsync"/> is meaningful here: the tests exercise the
++    /// hardening gate and the "no account linked" fall-through. Everything else is unreachable on
++    /// these paths and throws, so a future refactor that starts touching more services in this
++    /// area fails loudly instead of silently passing.
++    /// </summary>
++    private sealed class StubUserService : IUserService
++    {
++        public Task<User?> GetUserByGatewaySubjectAsync(string subject) => Task.FromResult<User?>(null);
++
++        public Task<User?> GetUserByIdAsync(int id) => throw new NotSupportedException();
++        public Task<User?> GetUserByUsernameAsync(string username) => throw new NotSupportedException();
++        public Task<User?> GetUserByEmailAsync(string email) => throw new NotSupportedException();
++        public Task<User> GetOrCreateUserFromRemoteIdentity(ClaimsIdentity remoteIdentity) => throw new NotSupportedException();
++        public Task<List<User>> GetAllUsersAsync() => throw new NotSupportedException();
++        public Task<User> CreateUserAsync(string username, string email, string password, bool isAdmin = false) => throw new NotSupportedException();
++        public Task<bool> UpdateUserAsync(User user) => throw new NotSupportedException();
++        public Task<bool> DeleteUserAsync(int id) => throw new NotSupportedException();
++        public Task<bool> AuthenticateUserAsync(string username, string password) => throw new NotSupportedException();
++        public Task<bool> SetUserActiveStatusAsync(int id, bool isActive) => throw new NotSupportedException();
++        public Task<List<MailAccount>> GetUserMailAccountsAsync(int userId) => throw new NotSupportedException();
++        public Task<bool> AssignMailAccountToUserAsync(int userId, int mailAccountId) => throw new NotSupportedException();
++        public Task<bool> RemoveMailAccountFromUserAsync(int userId, int mailAccountId) => throw new NotSupportedException();
++        public Task<bool> IsUserAdminAsync(int userId) => throw new NotSupportedException();
++        public Task<bool> IsUserAuthorizedForAccountAsync(int userId, int mailAccountId) => throw new NotSupportedException();
++        public Task<int> GetAdminCountAsync() => throw new NotSupportedException();
++        public string HashPassword(string password) => throw new NotSupportedException();
++        public bool VerifyPassword(string password, string storedHash) => throw new NotSupportedException();
++        public Task<bool> SetTwoFactorEnabledAsync(int userId, bool enabled) => throw new NotSupportedException();
++        public Task<bool> SetTwoFactorSecretAsync(int userId, string secret) => throw new NotSupportedException();
++        public Task<bool> SetTwoFactorBackupCodesAsync(int userId, string backupCodes) => throw new NotSupportedException();
++        public Task<string?> GetTwoFactorSecretAsync(int userId) => throw new NotSupportedException();
++        public Task<bool> VerifyTwoFactorBackupCodeAsync(int userId, string backupCode) => throw new NotSupportedException();
++        public Task<bool> RemoveUsedBackupCodeAsync(int userId, string usedCode) => throw new NotSupportedException();
++        public Task<GatewayBindResult> TryBindGatewaySubjectAsync(int userId, string subject) => throw new NotSupportedException();
++        public Task<GatewayUnbindOutcome> UnbindGatewaySubjectAsync(int userId) => throw new NotSupportedException();
++        public Task TouchLastLoginAsync(int userId) => throw new NotSupportedException();
++    }
++
++    /// <summary>Minimal in-memory session so the middleware's sign-out suppression check works.</summary>
++    private sealed class MemorySessionFeature : ISessionFeature
++    {
++        public ISession Session { get; set; } = new MemorySession();
++
++        private sealed class MemorySession : ISession
++        {
++            private readonly Dictionary<string, byte[]> _store = new(StringComparer.Ordinal);
++
++            public bool IsAvailable => true;
++            public string Id => "test-session";
++            public IEnumerable<string> Keys => _store.Keys;
++
++            public void Clear() => _store.Clear();
++            public Task CommitAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
++            public Task LoadAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
++            public void Remove(string key) => _store.Remove(key);
++            public void Set(string key, byte[] value) => _store[key] = value;
++            public bool TryGetValue(string key, out byte[] value) => _store.TryGetValue(key, out value!);
++        }
++    }
++
++    private static HttpContext CreateContext(string? uid)
++    {
++        var context = new DefaultHttpContext();
++        context.Request.Path = "/";
++        context.Response.Body = new MemoryStream();
++        context.Features.Set<ISessionFeature>(new MemorySessionFeature());
++
++        if (uid is not null)
++        {
++            context.Request.Headers["X-Trim-Userid"] = uid;
++            context.Request.Headers["X-Trim-Username"] = "tester";
++        }
++
++        return context;
++    }
++
++    private static Task InvokeAsync(HttpContext context, SocketSecurityState state)
++    {
++        var middleware = new GatewayAuthMiddleware(
++            _ => Task.CompletedTask,
++            NullLogger<GatewayAuthMiddleware>.Instance);
++
++        return middleware.InvokeAsync(
++            context,
++            Options.Create(new GatewayOptions { Enabled = true, SharedSecret = null }),
++            new StubUserService(),
++            authService: null!,
++            accessLogService: null!,
++            socketSecurityState: state,
++            authenticationOptions: Options.Create(new MailArchiver.Models.AuthenticationOptions()),
++            localizer: new PassthroughLocalizer());
++    }
++
++    [Fact]
++    public async Task HardeningFailed_WithIdentityHeader_Returns503()
++    {
++        var state = new SocketSecurityState();
++        state.MarkFailed("/app/target/app.sock");
++
++        var context = CreateContext("1002");
++
++        await InvokeAsync(context, state);
++
++        Assert.Equal(StatusCodes.Status503ServiceUnavailable, context.Response.StatusCode);
++    }
++
++    [Fact]
++    public async Task HardeningFailed_WithoutIdentityHeader_FallsThroughToNativeLogin()
++    {
++        // This is the recovery path: password sign-in must stay reachable while the socket
++        // permissions are being fixed.
++        var state = new SocketSecurityState();
++        state.MarkFailed("/app/target/app.sock");
++
++        var context = CreateContext(uid: null);
++
++        await InvokeAsync(context, state);
++
++        Assert.NotEqual(StatusCodes.Status503ServiceUnavailable, context.Response.StatusCode);
++    }
++
++    [Fact]
++    public async Task HardeningSucceeded_WithIdentityHeader_DoesNotReturn503()
++    {
++        var state = new SocketSecurityState();
++        state.MarkHardened("/app/target/app.sock");
++
++        var context = CreateContext("1002");
++
++        // No account is linked to this subject, so the middleware continues down the pipeline;
++        // the point of the assertion is that the hardening gate does not fire.
++        await InvokeAsync(context, state);
++
++        Assert.NotEqual(StatusCodes.Status503ServiceUnavailable, context.Response.StatusCode);
++    }
++
++    [Fact]
++    public async Task Recovery_ClearsTheGateWithoutRestart()
++    {
++        var state = new SocketSecurityState();
++        state.MarkFailed("/app/target/app.sock");
++
++        var blocked = CreateContext("1002");
++        await InvokeAsync(blocked, state);
++        Assert.Equal(StatusCodes.Status503ServiceUnavailable, blocked.Response.StatusCode);
++
++        // The background service retries and calls MarkHardened once the permissions can be set.
++        state.MarkHardened("/app/target/app.sock");
++        Assert.False(state.HardeningFailed);
++        Assert.True(state.IsHardened);
++
++        var recovered = CreateContext("1002");
++        await InvokeAsync(recovered, state);
++        Assert.NotEqual(StatusCodes.Status503ServiceUnavailable, recovered.Response.StatusCode);
++    }
++
++    /// <summary>
++    /// Guard against the authentication wiring quietly disappearing.
++    ///
++    /// Cookie sessions rely on context.User being populated by the framework's implicitly registered
++    /// UseAuthentication middleware. That registration only happens when authentication services are
++    /// present; if someone removes AddAuthentication (or the whole call), cookie sign-in stops being
++    /// recognised and every session bounces to the login page — silently, with no compile error.
++    /// This assertion makes that a red test instead.
++    ///
++    /// Scope, stated honestly: it proves the services are registered, which is the precondition.
++    /// The implicit UseAuthentication insertion itself is framework behaviour and cannot be asserted
++    /// from here; that is what the S1 case in uat-p0-cookie.sh covers end to end.
++    /// </summary>
++    [Fact]
++    public void AuthenticationServices_AreRegistered()
++    {
++        var builder = Microsoft.AspNetCore.Builder.WebApplication.CreateBuilder(
++            new Microsoft.AspNetCore.Builder.WebApplicationOptions
++            {
++                EnvironmentName = "Development",
++                ApplicationName = typeof(GatewayAuthMiddlewareSocketTests).Assembly.GetName().Name
++            });
++
++        builder.Services.AddAuthentication("Cookies").AddCookie("Cookies");
++        var app = builder.Build();
++
++        Assert.NotNull(app.Services.GetService<IAuthenticationSchemeProvider>());
++
++        // IAuthenticationService is scoped, so it has to be resolved from a scope, not the root.
++        using var scope = app.Services.CreateScope();
++        Assert.NotNull(scope.ServiceProvider.GetService<Microsoft.AspNetCore.Authentication.IAuthenticationService>());
++    }
++}
+diff --git a/wwwroot/js/audit-export.js b/wwwroot/js/audit-export.js
+index 61fa144..e4057fa 100644
+--- a/wwwroot/js/audit-export.js
++++ b/wwwroot/js/audit-export.js
+@@ -29,12 +29,12 @@
+     function renderActions(job) {
+         var actions = '';
+         if (job.status === 'Completed' || job.status === 'Downloaded') {
+-            actions += '<a href="/Logs/DownloadAuditExport?jobId=' + encodeURIComponent(job.jobId) +
++            actions += '<a href="' + (window.__appBase || '') + '/Logs/DownloadAuditExport?jobId=' + encodeURIComponent(job.jobId) +
+                 '" class="btn btn-outline-primary btn-sm" title="Download"><i class="bi bi-download"></i></a> ';
+         }
+         if (job.status === 'Queued' || job.status === 'Running') {
+             var token = document.querySelector('#auditExportJobs input[name="__RequestVerificationToken"]');
+-            actions += '<form method="post" action="/Logs/CancelAuditExport" class="d-inline">' +
++            actions += '<form method="post" action="' + (window.__appBase || '') + '/Logs/CancelAuditExport" class="d-inline">' +
+                 '<input type="hidden" name="__RequestVerificationToken" value="' + (token ? token.value : '') + '" />' +
+                 '<input type="hidden" name="jobId" value="' + escapeHtml(job.jobId) + '" />' +
+                 '<button type="submit" class="btn btn-outline-danger btn-sm" title="Abbrechen" ' +
+@@ -116,7 +116,7 @@
+         }
+ 
+         activeJobIds.forEach(function (jobId) {
+-            fetch('/Logs/AuditExportStatus?jobId=' + encodeURIComponent(jobId), {
++            fetch((window.__appBase || '') + '/Logs/AuditExportStatus?jobId=' + encodeURIComponent(jobId), {
+                 headers: { 'X-Requested-With': 'XMLHttpRequest' }
+             })
+                 .then(function (response) { return response.ok ? response.json() : null; })
