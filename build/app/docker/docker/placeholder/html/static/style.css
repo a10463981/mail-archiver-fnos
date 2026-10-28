@@ -1,0 +1,8 @@
+:root { color-scheme: light dark; }
+body { margin:0; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background:#0f1115; color:#e6e8ee; }
+main { max-width: 680px; margin: 12vh auto; padding: 32px; border:1px solid #2a2f3a; border-radius:14px; background:#151922; }
+h1 { margin:0 0 6px; font-size:28px; }
+.sub { margin:0 0 20px; color:#8b94a7; font-size:14px; }
+ul.ok { padding-left: 20px; line-height: 1.9; }
+.hint { margin-top: 22px; color:#8b94a7; font-size:14px; }
+a { color:#6ea8fe; }
