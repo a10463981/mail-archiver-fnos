@@ -1,0 +1,97 @@
+# mail-archiver-fnos —— fnOS fpk 权威 compose（唯一权威版本，2026-10-28 定稿）
+#
+# 这份文件是「挂载点 ↔ 宿主目录 ↔ 属主/权限」的唯一事实源；评审侧 sample
+# （recon/fnos-fpk-p1/docker-compose.fnos.yaml）以本文件为准对齐。
+#
+# 四条硬约束（改前必读）：
+#   1) 不 publish 任何 TCP 端口。应用只通过 ${TRIM_APPDEST}/app.sock 暴露给 fnOS 统一网关；
+#      一旦发布端口，局域网任何进程都能伪造 X-Trim-Isadmin 冒充管理员（已实测）。
+#   2) 容器一律以 ${TRIM_UID}:${TRIM_GID} 运行（非 root）。凡 bind mount 进容器的宿主目录，
+#      属主必须是 TRIM_UID —— 否则 DataProtection 写不了 keyring → 每次重启换密钥 → 全员掉线
+#      （已实测：属主 root 时首页 500 + CryptographicException/UnauthorizedAccessException）。
+#      cmd/lib_runtime_dirs.sh 负责预建 + chown + 校验。
+#   3) 宿主路径全部走 ${TRIM_*}，不得写死绝对路径（换卷/迁移后会失效）。
+#   4) 变量插值只能来自平台注入的 ${TRIM_*}；密码/密钥一律走 env_file，不进本文件。
+
+services:
+  app:
+    image: mail-archiver-fnos:zh-39f59d2
+    container_name: mail-archiver-fnos
+    # 非 root 运行：与宿主目录属主一致，避免 chown/权限问题
+    user: "${TRIM_UID:?TRIM_UID missing}:${TRIM_GID:?TRIM_GID missing}"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      # 冷启动占位值在镜像载荷里，install_callback 用真实值覆盖（600）
+      - "${TRIM_APPDEST:?TRIM_APPDEST missing}/docker/app.env"
+    volumes:
+      # ① unix socket 落点：容器内外同路径，使 LISTEN_UNIX_SOCKET 在两侧都成立
+      #    属主=应用用户（载荷目录），权限由 UnixSocketPermissionService 收到 600
+      - "${TRIM_APPDEST:?TRIM_APPDEST missing}:${TRIM_APPDEST:?TRIM_APPDEST missing}"
+
+      # ② 配置/日志/DataProtection-Keys 的父目录  →  容器 /data
+      #    宿主权限 750，属主 TRIM_UID
+      - "${TRIM_PKGVAR:?TRIM_PKGVAR missing}:/data"
+
+      # ③ DataProtection 密钥环  →  容器 /data/DataProtection-Keys
+      #    独立挂载便于备份/迁移；**必须可读+可写**（DP 要枚举 keyring 文件并写 key-*.xml）
+      #    宿主权限 700，属主 TRIM_UID；属主错 → 重启换密钥 → 全员掉线（MF-1）
+      - "${TRIM_PKGVAR}/DataProtection-Keys:/data/DataProtection-Keys"
+
+      # ④ 运行期日志  →  容器 /data/logs，宿主 750
+      - "${TRIM_PKGVAR}/logs:/data/logs"
+
+      # ⑤ EML/MBox 导入的暂存区  →  容器 /app/uploads（应用按 ContentRoot 拼 uploads/eml、uploads/mbox）
+      #    必须可写；宿主 750，属主 TRIM_UID
+      - "${TRIM_PKGVAR}/uploads:/app/uploads"
+
+      # ⑥ 审计/邮件导出目录  →  容器 /app/exports，必须可写；宿主 750
+      - "${TRIM_PKGVAR}/exports:/app/exports"
+
+      # ⑦ 业务数据：邮件原文/附件  →  容器 /mail
+      #    宿主是 ${TRIM_PKGVAR}/data/mail；data 常为指向存储空间的符号链接（750）
+      - "${TRIM_PKGVAR}/data/mail:/mail"
+
+      # ⑧ PostgreSQL 数据目录  →  容器 /var/lib/postgresql/data，宿主 700（PG 要求 0700）
+      - "${TRIM_PKGVAR}/data/pgdata:/var/lib/postgresql/data"
+    tmpfs:
+      # 仅 /var/run 需要（nginx 缓存目录已删：本应用用 Kestrel，无 nginx）
+      - /var/run:rw,size=4m,mode=0777
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: mail-archiver-fnos-db
+    # 与 app 同一 uid：pgdata 属主一致，避免 initdb 失败
+    user: "${TRIM_UID:?TRIM_UID missing}:${TRIM_GID:?TRIM_GID missing}"
+    restart: unless-stopped
+    stop_grace_period: 60s
+    environment:
+      POSTGRES_DB: mailarchiver
+      POSTGRES_USER: mailarchiver
+      # 密码只从文件读，避免 docker inspect / 命令行明文
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      # ⑨ 数据库口令（只读）  →  容器 /run/secrets/pg_password；宿主 600，属主 TRIM_UID
+      - "${TRIM_APPDEST:?TRIM_APPDEST missing}/docker/pg_password:/run/secrets/pg_password:ro"
+      # ⑧ 与 app 共用同一个 pgdata 宿主目录（700）
+      - "${TRIM_PKGVAR}/data/pgdata:/var/lib/postgresql/data"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mailarchiver -d mailarchiver"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
