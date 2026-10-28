@@ -1,0 +1,151 @@
+#!/bin/bash
+# 设置页保存后：改密码 / 换数据目录 / 换时区，然后重建容器让新环境生效。
+set -u
+
+APP_NAME=mail-archiver-fnos
+CFG_DIR="${TRIM_PKGETC}"
+VAR_DIR="${TRIM_PKGVAR}"
+APPDEST="${TRIM_APPDEST}"
+LOG_FILE="${TRIM_TEMP_LOGFILE:-${TRIM_PKGVAR:-/tmp}/lifecycle.log}"
+APP_ENV="${CFG_DIR}/app.env"
+SETTINGS="${CFG_DIR}/settings.env"
+COMPOSE_FILE="${APPDEST}/docker/docker-compose.yaml"
+DATA_ROOT="${VAR_DIR}/data"
+
+say() { echo "[${APP_NAME}] $*"; }
+fail() { echo "[${APP_NAME}] ERROR: $*" >>"${LOG_FILE}" 2>/dev/null || true; echo "[${APP_NAME}] ERROR: $*" >&2; exit 1; }
+warn() { echo "[${APP_NAME}] WARN: $*" >>"${LOG_FILE}" 2>/dev/null || true; echo "[${APP_NAME}] WARN: $*" >&2; }
+trace() { { mkdir -p "${VAR_DIR}" && echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"${VAR_DIR}/lifecycle.log"; } 2>/dev/null || true; }
+compose() { docker compose -p "${APP_NAME}" -f "${COMPOSE_FILE}" "$@"; }
+
+trace "config_callback begin"
+[ -f "${APP_ENV}" ] || fail "缺少 ${APP_ENV}，请先重装应用（或运行一次 cmd/install_callback）。"
+
+# 1) 换数据目录：只改符号链接，不搬数据
+data_mode="${wizard_data_mode:-keep}"
+data_target="${wizard_data_dir:-}"
+if [ "${data_mode}" = "custom" ]; then
+    # R1：绝不 rm -rf。migrate_data_root 会先 compose down（不带 -v）、把旧根 mv 成 .bak-时间戳、
+    # 建新根并写探针验证；任一步失败都会把旧根移回原位并返回非 0，调用方据此中止。
+    . "$(dirname "$0")/lib/data-root-migration.sh" 2>/dev/null \
+        || . "${APPDEST}/cmd/lib/data-root-migration.sh" 2>/dev/null \
+        || fail "缺少 data-root-migration.sh（fpk 打包不完整）"
+    _mig_bak="$(ls -d "${DATA_ROOT}".bak-* 2>/dev/null | tail -1 || true)"
+    if ! migrate_data_root "${DATA_ROOT}" "${data_target}" "${APP_NAME}" "${COMPOSE_FILE}"; then
+        fail "数据目录切换失败：原有数据未被改动，已恢复原状。请检查目标目录是否可写后重试。"
+    fi
+    printf '%s\n' "${data_target}" >"${CFG_DIR}/data_target" 2>/dev/null || true
+    # MF-1：迁移内部会 `compose down`，必须**主动拉起来**，否则用户看到"应用停了"、点启动后进的是空库，
+    #       会再次被理解为"数据全丢"（本次事故的同型场景）。
+    _restarted=0
+    if docker compose version >/dev/null 2>&1; then
+        if compose up -d >/dev/null 2>&1; then _restarted=1; fi
+    fi
+    if [ "${_restarted}" = "1" ]; then
+        say "数据目录已切换，应用已按新目录重启（若首页显示空库属正常，见下）。"
+    else
+        warn "数据目录已切换，但自动启动失败；请到应用中心点一次「启动」。"
+    fi
+    say "⚠️ 新目录当前是**空库**（0 账号、0 邮件）：应用只会使用新目录里的数据。"
+    if [ -n "${_mig_bak}" ]; then
+        say "   原有数据完整保留在：${_mig_bak}（**没有删除**）。"
+        say "   如需沿用旧数据，请先把该目录内容迁到新目录，再点「重启」；或把它手工移回原位后重新切换。"
+    fi
+    printf '%s\n' "${data_target}" >"${CFG_DIR}/data_target" 2>/dev/null || true
+elif [ "${data_mode}" = "default" ]; then
+    if [ -L "${DATA_ROOT}" ]; then
+        rm -f "${DATA_ROOT}" && mkdir -p "${DATA_ROOT}/mail" "${DATA_ROOT}/pgdata"
+        say "数据目录已恢复为应用自有目录：${DATA_ROOT}"
+    fi
+fi
+
+# 2) 重置管理员密码（留空=不改）
+# 关键（P0 修复）：不再只写 app.env —— Authentication__Password 只对"首次建号"生效，
+# 对已存在账号无效（用户报过"设置页改密码＝白改"）。现在**直接调用包内 CLI 改库**：
+# 立即生效、无需重启；密码只经环境变量传入，不进命令行参数（避免 ps / shell 历史泄漏）。
+np="${wizard_admin_password:-}"
+if [ -n "${np}" ]; then
+    _target_user="$(grep -m1 '^Authentication__Username=' "${APP_ENV}" 2>/dev/null | cut -d= -f2-)"
+    [ -n "${_target_user}" ] || _target_user="admin"
+    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${APP_NAME}$"; then
+        fail "应用容器（${APP_NAME}）未在运行，无法改库。请先到应用中心启动应用，再回到设置页重试。"
+    fi
+    # MF-4：**只调用一次**（旧实现调用两次 ⇒ 双写库 + 双条审计，排障时容易误判）
+    _reset_rc=0
+    _reset_out="$(MFA_RESET_PASSWORD="${np}" docker exec -e MFA_RESET_PASSWORD \
+        "${APP_NAME}" dotnet MailArchiver.dll --reset-password "${_target_user}" 2>&1)" || _reset_rc=$?
+    _reset_out="$(printf '%s' "${_reset_out}" | grep -viE '^warn|^info|^ +at |^ +---|^      ' | head -3 | tr '\n' ' ')"
+    if [ "${_reset_rc}" = "0" ]; then
+        say "管理员登录密码已重置（账号 ${_target_user}），**立即生效**，无需重启。"
+        say "注：密码只以哈希保存，无法查看，只能重置。"
+        trace "config_callback: password reset via CLI ok (${_target_user})"
+    else
+        fail "重置管理员密码失败（账号 ${_target_user}）。CLI 输出：${_reset_out}
+请确认应用正在运行（应用中心 → 启动），或改用命令行：
+  docker exec -e MFA_RESET_PASSWORD='新密码' ${APP_NAME} dotnet MailArchiver.dll --reset-password ${_target_user}"
+    fi
+    (umask 077; printf '%s\n' "${np}" >"${CFG_DIR}/admin_password") || warn "写入 ${CFG_DIR}/admin_password 失败（不影响登录）"
+    chmod 600 "${CFG_DIR}/admin_password" 2>/dev/null || true
+    if grep -q '^Authentication__Password=' "${APP_ENV}" 2>/dev/null; then
+        sed -i "s|^Authentication__Password=.*|Authentication__Password=${np}|" "${APP_ENV}" || fail "写入 ${APP_ENV} 失败"
+    else
+        printf 'Authentication__Password=%s\n' "${np}" >>"${APP_ENV}" || fail "写入 ${APP_ENV} 失败"
+    fi
+fi
+
+# 3) 改时区
+tz="${wizard_timezone:-}"
+if [ -n "${tz}" ]; then
+    sed -i "s#^TimeZone__DisplayTimeZoneId=.*#TimeZone__DisplayTimeZoneId=${tz}#; s#^TZ=.*#TZ=${tz}#" "${APP_ENV}" 2>/dev/null \
+        || fail "写入时区失败：${APP_ENV}"
+    say "时区已更新为 ${tz}"
+fi
+
+# ---------------------------------------------------------------- 运行期目录（权威：cmd/lib_runtime_dirs.sh）
+LIB_DIRS="$(dirname "$0")/lib_runtime_dirs.sh"
+if [ -r "${LIB_DIRS}" ]; then
+    . "${LIB_DIRS}"
+else
+    fail "缺少 ${LIB_DIRS}（fpk 打包不完整）"
+fi
+
+
+ensure_runtime_dirs
+verify_runtime_dirs || fail "运行目录属主/权限校验失败"
+
+# 4) 把 admin_password 同步进 app.env（唯一真源是 admin_password 文件）
+if [ -s "${CFG_DIR}/admin_password" ]; then
+    cur="$(head -n1 "${CFG_DIR}/admin_password")"
+    sed -i "s#^Authentication__Password=.*#Authentication__Password=${cur}#" "${APP_ENV}" 2>/dev/null || true
+fi
+
+# 5) settings.env 同步（脚本自用）
+(umask 077; cat >"${SETTINGS}" <<EOF
+DATA_MODE=${data_mode}
+DATA_ROOT=${DATA_ROOT}
+DATA_TARGET=$(readlink "${DATA_ROOT}" 2>/dev/null || echo "${DATA_ROOT}")
+TZ_ID=$(grep -m1 '^TZ=' "${APP_ENV}" 2>/dev/null | cut -d= -f2)
+ADMIN_USER=$(grep -m1 '^Authentication__Username=' "${APP_ENV}" 2>/dev/null | cut -d= -f2)
+INSTALLED_VERSION=${TRIM_APPVER:-0.1.0}
+EOF
+) 2>/dev/null || true
+
+# 5b) 渲染到载荷（compose 读的是 ${TRIM_APPDEST}/docker/app.env）
+install -m 600 "${APP_ENV}" "${APPDEST}/docker/app.env" 2>/dev/null \
+    || warn "渲染 ${APPDEST}/docker/app.env 失败，容器可能仍用旧配置。"
+[ -s "${CFG_DIR}/pg_password" ] && install -m 600 "${CFG_DIR}/pg_password" "${APPDEST}/docker/pg_password" 2>/dev/null || true
+
+# 6) 配置已落盘，但【不自动重建容器】
+#    原因（P0，已实测）：`compose up -d --force-recreate` 会把正在使用的容器当场杀掉，
+#    用户看到的就是"进入界面后立即闪退"。改为把重启交给用户/平台状态机：
+#      · 配置已经写进 ${CFG_DIR}/app.env 与载荷 docker/app.env，重启后即生效；
+#      · 用户点一下应用中心「停止 → 启动」即可，无需重装。
+say "配置已保存：**需要重启应用后才生效**（应用中心 → 停止 → 启动）。当前页面不会被打断（这是为了避免打断正在使用的人）。"
+if docker compose version >/dev/null 2>&1; then
+    say "若要立即生效，请到应用中心点一次「重启」；本脚本不会自动重启，以免打断正在使用的人。"
+else
+    warn "docker compose 不可用；配置已保存，请在应用中心手动停止/启动。"
+fi
+
+trace "config_callback ok"
+exit 0
