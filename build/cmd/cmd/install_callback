@@ -1,0 +1,369 @@
+#!/bin/bash
+# 安装后：建目录 / 生成密钥 / 写配置。必须幂等（修复安装、重装都会再跑一遍）。
+set -u
+
+APP_NAME=mail-archiver-fnos
+VAR_DIR="${TRIM_PKGVAR}"
+CFG_DIR="${TRIM_PKGETC}"
+APPDEST="${TRIM_APPDEST}"
+LOG_FILE="${TRIM_TEMP_LOGFILE:-${TRIM_PKGVAR:-/tmp}/lifecycle.log}"
+
+DATA_ROOT="${VAR_DIR}/data"          # 业务数据根（可被替换成指向存储空间的符号链接）
+MAIL_DIR="${DATA_ROOT}/mail"         # 邮件原文 / 附件
+PG_DIR="${DATA_ROOT}/pgdata"         # PostgreSQL 数据目录
+SETTINGS="${CFG_DIR}/settings.env"
+APP_ENV="${CFG_DIR}/app.env"
+PG_PASS_FILE="${CFG_DIR}/pg_password"
+DP_KEYS_DIR="${VAR_DIR}/DataProtection-Keys"
+
+say() { echo "[${APP_NAME}] $*"; }
+warn() { echo "[${APP_NAME}] WARN: $*" >>"${LOG_FILE}" 2>/dev/null || true; echo "[${APP_NAME}] WARN: $*" >&2; }
+fail() { echo "[${APP_NAME}] ERROR: $*" >>"${LOG_FILE}" 2>/dev/null || true; echo "[${APP_NAME}] ERROR: $*" >&2; exit 1; }
+trace() { { mkdir -p "${VAR_DIR}" && echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"${VAR_DIR}/lifecycle.log"; } 2>/dev/null || true; }
+
+trace "install_callback begin (uid=$(id -u) user=$(id -un))"
+[ -n "${APPDEST:-}" ] || fail "TRIM_APPDEST 缺失"
+[ -f "${APPDEST}/docker/docker-compose.yaml" ] || fail "compose 文件缺失：${APPDEST}/docker/docker-compose.yaml"
+
+mkdir -p "${VAR_DIR}/logs" "${CFG_DIR}" "${DP_KEYS_DIR}" || fail "创建目录失败（${VAR_DIR} / ${CFG_DIR}）"
+
+# ---------------------------------------------------------------- 业务数据根
+# 用户选了存储空间：先建符号链接（目标不可写就回落，不假装成功）
+data_mode="${wizard_data_mode:-keep}"      # keep|custom|default
+data_target="${wizard_data_dir:-}"
+prev_target="$(readlink "${DATA_ROOT}" 2>/dev/null || true)"
+
+case "${data_mode}" in
+    custom)
+        [ -n "${data_target}" ] || fail "选择「改到指定目录」但未填写路径。"
+        case "${data_target}" in
+            /vol[0-9]*|/vol[0-9]*/) ;;
+            *) fail "数据目录必须位于存储空间（/volN/...），当前：${data_target}" ;;
+        esac
+        if [ ! -d "${data_target}" ] || [ ! -w "${data_target}" ]; then
+            fail "数据目录不可写：${data_target}
+请在「应用设置 → 访问权限」里把该目录授权给本应用（应用用户：${TRIM_UID}），再回来重试。"
+        fi
+        if [ -L "${DATA_ROOT}" ] && [ "${prev_target}" != "${data_target}" ]; then
+            warn "数据根从 ${prev_target:-<无>} 切到 ${data_target}；旧目录内容不会自动搬迁。"
+        fi
+        # R1：绝不 rm -rf。旧根一律 mv 成 .bak-时间戳（保留）；失败则中止且不动数据。
+        . "$(dirname "$0")/lib/data-root-migration.sh" 2>/dev/null \
+            || . "${APPDEST}/cmd/lib/data-root-migration.sh" 2>/dev/null \
+            || fail "缺少 data-root-migration.sh（fpk 打包不完整）"
+        if ! migrate_data_root "${DATA_ROOT}" "${data_target}" "${APP_NAME}" "${APPDEST}/docker/docker-compose.yaml"; then
+            fail "数据根设置失败：原有数据未被改动。请检查 ${data_target} 是否可写后重试。"
+        fi
+        say "数据根：${DATA_ROOT} -> ${data_target}"
+        ;;
+    default)
+        [ -L "${DATA_ROOT}" ] && rm -f "${DATA_ROOT}" && say "数据根恢复为应用自有目录：${DATA_ROOT}"
+        ;;
+    *)
+        if [ -L "${DATA_ROOT}" ]; then
+            say "数据根保持现有链接：${DATA_ROOT} -> $(readlink "${DATA_ROOT}")"
+        elif [ -s "${CFG_DIR}/data_target" ]; then
+            # 上一次装到存储空间后，@appdata 可能被"失败的安装"回滚清掉（已实测），
+            # 这里按记住的路径把链接接回去，否则会看起来像"数据丢了"。
+            remembered="$(head -n1 "${CFG_DIR}/data_target")"
+            if [ -n "${remembered}" ] && [ -d "${remembered}" ] && [ "${remembered}" != "${DATA_ROOT}" ]; then
+                # R1：这里只可能是空壳/占位目录；仍不 rm -rf，有内容就 mv 到 .bak
+                if [ -d "${DATA_ROOT}" ] && [ -n "$(ls -A "${DATA_ROOT}" 2>/dev/null)" ]; then
+                    mv "${DATA_ROOT}" "${DATA_ROOT}.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+                else
+                    rmdir "${DATA_ROOT}" 2>/dev/null || rm -f "${DATA_ROOT}" 2>/dev/null || true
+                fi
+                ln -sfn "${remembered}" "${DATA_ROOT}" 2>/dev/null || true
+                say "按上次记录恢复数据根：${DATA_ROOT} -> ${remembered}"
+            fi
+        fi
+        ;;
+esac
+
+mkdir -p "${DATA_ROOT}" "${MAIL_DIR}" "${PG_DIR}" 2>/dev/null || true
+[ -d "${MAIL_DIR}" ] || fail "无法创建 ${MAIL_DIR}（数据根不可写，请检查授权）"
+[ -d "${PG_DIR}" ]   || fail "无法创建 ${PG_DIR}（数据根不可写，请检查授权）"
+chmod 750 "${MAIL_DIR}" "${PG_DIR}" 2>/dev/null || true
+
+# ---------------------------------------------------------------- 密钥（幂等）
+gen_b64() { head -c "$1" /dev/urandom | base64 | tr -d '\n'; }
+
+if [ -s "${PG_PASS_FILE}" ]; then
+    say "沿用已有 PostgreSQL 密码（${PG_PASS_FILE}）"
+else
+    (umask 077; gen_b64 24 >"${PG_PASS_FILE}") || fail "写入 PostgreSQL 密码失败"
+    say "已生成 PostgreSQL 密码（${PG_PASS_FILE}，600）"
+fi
+chmod 600 "${PG_PASS_FILE}" 2>/dev/null || true
+
+if [ -s "${CFG_DIR}/credential_encryption_key" ]; then
+    CRED_KEY="$(head -n1 "${CFG_DIR}/credential_encryption_key")"
+    say "沿用已有 CredentialEncryptionKey"
+else
+    CRED_KEY="$(gen_b64 32)"
+    (umask 077; printf '%s\n' "${CRED_KEY}" >"${CFG_DIR}/credential_encryption_key") || fail "写入 CredentialEncryptionKey 失败"
+    say "已生成 CredentialEncryptionKey（${CFG_DIR}/credential_encryption_key，600）"
+fi
+chmod 600 "${CFG_DIR}/credential_encryption_key" 2>/dev/null || true
+
+# ---------------------------------------------------------------- 管理员账号
+# 选择：安装向导收集首个管理员账号密码（而非首次打开自助创建）。
+# 理由：上游没有首启建号流程，自助创建等于要改源码；向导收集零改动，且失败可在设置页重置。
+ADMIN_USER="${wizard_admin_username:-admin}"
+ADMIN_PASS="${wizard_admin_password:-}"
+# 必修 3（真根因）：向导给了密码就以向导为准；只有向导没给时才回落到已保存的副本。
+# 旧实现无条件用文件覆盖向导输入 —— 而 R9 曾把该文件替换成"不可还原指纹"，
+# 于是【每次重装都会把向导里的密码丢掉，并把这个说明文字当成密码写进 app.env】，
+# 用户在向导里设的密码从来没生效过（这才是"装完永远猜不到密码"的直接机制）。
+_pw_file="${CFG_DIR}/admin_password"
+_pw_from_wizard=0
+[ -n "${wizard_admin_password:-}" ] && _pw_from_wizard=1
+if [ "${_pw_from_wizard}" = "0" ] && [ -s "${_pw_file}" ]; then
+    _saved="$(head -n1 "${_pw_file}")"
+    case "${_saved}" in
+        *fingerprint*|*不可还原*|*首次建号*)
+            warn "${_pw_file} 里是历史遗留的指纹/说明文字，不是真密码，已忽略；请用 --reset-password 重新设置。"
+            _saved=""
+            ;;
+    esac
+    if [ -n "${_saved}" ]; then
+        ADMIN_PASS="${_saved}"
+        say "未提供新密码，沿用已保存的管理员密码（${_pw_file}）。"
+    fi
+fi
+if [ -z "${ADMIN_PASS}" ]; then
+    ADMIN_PASS="change_me_$(date +%s)"
+    warn "向导未提供密码且无可用副本，已生成临时密码（请用 --reset-password 立即修改）。"
+    _pw_from_wizard=1
+fi
+if [ "${_pw_from_wizard}" = "1" ]; then
+    (umask 077; printf '%s\n' "${ADMIN_PASS}" >"${_pw_file}") || fail "写入管理员密码失败"
+    say "已保存管理员密码（${CFG_DIR}/admin_password，600）"
+fi
+chmod 600 "${CFG_DIR}/admin_password" 2>/dev/null || true
+
+# 记住数据落点（供下次安装/失败回滚后自愈）
+if [ -L "${DATA_ROOT}" ]; then
+    readlink "${DATA_ROOT}" >"${CFG_DIR}/data_target" 2>/dev/null || true
+elif [ -s "${CFG_DIR}/data_target" ]; then
+    : # 保持上次记录
+else
+    printf '%s\n' "${DATA_ROOT}" >"${CFG_DIR}/data_target" 2>/dev/null || true
+fi
+
+TZ_ID="${wizard_timezone:-Asia/Shanghai}"
+
+# ---------------------------------------------------------------- app.env（容器环境）
+# 只走文件：compose 不做变量插值，密码/密钥不进命令行、不进 compose 文本
+(umask 077; cat >"${APP_ENV}" <<EOF
+# 由 ${APP_NAME}/cmd/install_callback 生成，勿手工编辑（改设置页会重新生成）
+LISTEN_UNIX_SOCKET=${APPDEST}/app.sock
+PATH_BASE=/app/mail-archiver-fnos
+Gateway__Enabled=true
+Gateway__UserIdHeader=X-Trim-Userid
+Gateway__UsernameHeader=X-Trim-Username
+Gateway__LogoutRedirectUrl=
+Localization__DefaultCulture=zh-CN
+Authentication__CookieSameSite=Strict
+Authentication__Username=${ADMIN_USER}
+Authentication__Password=${ADMIN_PASS}
+TimeZone__DisplayTimeZoneId=${TZ_ID}
+TZ=${TZ_ID}
+DataProtection__KeyPath=/data/DataProtection-Keys
+Security__CredentialEncryptionKey=${CRED_KEY}
+Security__EncryptAccountCredentials=true
+ConnectionStrings__DefaultConnection=Host=postgres;Port=5432;Database=mailarchiver;Username=mailarchiver;Password=$(head -n1 "${PG_PASS_FILE}");Pooling=true
+ReleaseNotes__Enabled=false
+Logging__LogLevel__Default=Information
+# R13：这一行只是回落值（LISTEN_UNIX_SOCKET 缺失时才生效）；http://unix:/path 是 Kestrel 合法语法
+ASPNETCORE_URLS=http://unix:${APPDEST}/app.sock
+EOF
+) || fail "写入 ${APP_ENV} 失败"
+chmod 600 "${APP_ENV}" 2>/dev/null || true
+
+# ---------------------------------------------------------------- settings.env（脚本自用）
+(umask 077; cat >"${SETTINGS}" <<EOF
+DATA_MODE=${data_mode}
+DATA_ROOT=${DATA_ROOT}
+DATA_TARGET=$(readlink "${DATA_ROOT}" 2>/dev/null || echo "${DATA_ROOT}")
+TZ_ID=${TZ_ID}
+ADMIN_USER=${ADMIN_USER}
+INSTALLED_VERSION=${TRIM_APPVER:-0.1.0}
+EOF
+) || fail "写入 ${SETTINGS} 失败"
+chmod 600 "${SETTINGS}" 2>/dev/null || true
+
+# ---------------------------------------------------------------- 镜像准备
+# 策略：包内 tar 优先（离线/慢网/中文镜像），否则走 fnOS 镜像站拉取。
+# 镜像只影响安装期，不参与运行期逻辑；中文版打成 mail-archiver-fnos:zh-<commit> 的 tar 即可。
+IMAGE_REF="$(head -n1 "${APPDEST}/docker/image.ref" 2>/dev/null || echo mail-archiver-fnos:zh-39f59d2)"
+IMAGE_TAR="$(ls "${APPDEST}"/images/*.tar 2>/dev/null | head -n1 || true)"
+
+if docker image inspect "${IMAGE_REF}" >/dev/null 2>&1; then
+    say "镜像已存在：${IMAGE_REF}（跳过导入/拉取）"
+else
+    if [ -n "${IMAGE_TAR}" ]; then
+        say "从包内导入镜像：${IMAGE_TAR}"
+        if docker load -i "${IMAGE_TAR}" >/dev/null 2>&1; then
+            say "docker load 完成"
+        else
+            warn "docker load 失败（${IMAGE_TAR}），改为在线拉取"
+        fi
+    fi
+    if ! docker image inspect "${IMAGE_REF}" >/dev/null 2>&1; then
+        say "本地无镜像，尝试拉取 ${IMAGE_REF}（走 fnOS 镜像站 docker.fnnas.com）"
+        docker pull "${IMAGE_REF}" >/dev/null 2>&1 \
+            || fail "镜像 ${IMAGE_REF} 既不在包内也无法拉取。离线安装请把 tar 放到 ${APPDEST}/images/。"
+        say "镜像拉取完成"
+    fi
+fi
+
+# PostgreSQL 基础镜像：同样先看本地，再走镜像站
+if ! docker image inspect postgres:16-alpine >/dev/null 2>&1; then
+    say "拉取 postgres:16-alpine"
+    docker pull postgres:16-alpine >/dev/null 2>&1 || fail "postgres:16-alpine 拉取失败，请检查网络或预置镜像。"
+fi
+
+# ---------------------------------------------------------------- 渲染到载荷
+# compose 在 install_callback 之前就会被平台校验，所以载荷里必须自带一份占位 app.env / pg_password；
+# 这里用真实值覆盖它们（权威副本仍在 @appconf）。载荷与容器内路径一致（compose 把 ${TRIM_APPDEST} 挂到同名路径）。
+install -m 600 "${APP_ENV}"      "${APPDEST}/docker/app.env"      || fail "渲染 ${APPDEST}/docker/app.env 失败"
+install -m 600 "${PG_PASS_FILE}" "${APPDEST}/docker/pg_password"  || fail "渲染 ${APPDEST}/docker/pg_password 失败"
+
+# ---------------------------------------------------------------- 运行期目录（权威：cmd/lib_runtime_dirs.sh）
+LIB_DIRS="$(dirname "$0")/lib_runtime_dirs.sh"
+if [ -r "${LIB_DIRS}" ]; then
+    . "${LIB_DIRS}"
+else
+    fail "缺少 ${LIB_DIRS}（fpk 打包不完整）"
+fi
+
+
+ensure_runtime_dirs
+
+# ---------------------------------------------------------------- 目录属主自检
+owner_uid="$(stat -c '%u' "${DATA_ROOT}" 2>/dev/null || echo '')"
+run_uid="$(id -u 2>/dev/null || echo '')"
+if [ -n "${owner_uid}" ] && [ "${owner_uid}" != "${TRIM_UID}" ] && [ "${owner_uid}" != "${run_uid}" ]; then
+    warn "数据根属主为 UID ${owner_uid}，既不是容器用户（${TRIM_UID}）也不是安装用户（${run_uid}），容器可能写不进去。"
+fi
+
+say "数据根      : $(readlink "${DATA_ROOT}" 2>/dev/null || echo "${DATA_ROOT}")"
+say "邮件/附件   : ${MAIL_DIR}"
+say "数据库      : ${PG_DIR}"
+say "配置        : ${CFG_DIR}/{app.env,settings.env,pg_password,admin_password,credential_encryption_key}（均 600）"
+# 真实配置已写盘：立刻重建容器，否则它们还带着"冷启动占位 app.env"（socket 会落在 /tmp）
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    # 注意：安装/升级场景下重建容器是可接受的，但它会中断正在使用的会话
+    say "正在按真实配置重建容器（已有会话会中断约 1 分钟，数据不受影响）"
+    docker compose -p "${APP_NAME}" -f "${APPDEST}/docker/docker-compose.yaml" up -d --force-recreate >/dev/null 2>&1 \
+        && say "容器已按真实配置重建" || warn "compose up 失败，请稍后在应用中心启动一次"
+fi
+
+# ---------------------------------------------------------------- 必修 3：账号已存在提示
+# 只有"库里没有该用户名"时才会用配置密码建号；已存在的账号密码不会改变。
+if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${APP_NAME}-db$"; then
+    _exists="$(docker exec -i "${APP_NAME}-db" psql -U mailarchiver -d mailarchiver -tA \
+        -c "select count(*) from mail_archiver.\"Users\" where \"Username\"='${ADMIN_USER}'" 2>/dev/null | tr -d ' ')"
+    if [ "${_exists:-0}" != "0" ] && [ "${_exists:-0}" != "" ]; then
+        say "⚠️ 账号 ${ADMIN_USER} 已存在：**该密码不会改变**（只有首次创建的账号才用配置密码）。"
+        say "   如需改密码，请用包内命令：docker exec ${APP_NAME} dotnet MailArchiver.dll --reset-password ${ADMIN_USER}"
+        trace "admin account already exists; password unchanged"
+    else
+        say "账号 ${ADMIN_USER} 为首次创建，将使用本次配置的密码。"
+    fi
+fi
+
+# ---------------------------------------------------------------- 已有数据检测（P0）
+# 若目标数据根里已存在非空 pgdata，本次重装会沿用旧库 ⇒ 旧账号/旧密码继续生效，
+# 向导里填的管理员密码对已存在账号无效。必须显式告知；若用户刚选过"删除数据"却没删干净，直接 fail。
+# MF-6：source 失败必须 fail —— 旧实现的 `|| true` 会让"已有数据库"检测整段静默跳过，
+#       导致保留数据重装时既不警告、也不提示用原密码（用户拿向导密码登不进而毫无线索）。
+if [ -r "$(dirname "$0")/lib/data-purge.sh" ]; then
+    . "$(dirname "$0")/lib/data-purge.sh"
+elif [ -r "${APPDEST}/cmd/lib/data-purge.sh" ]; then
+    . "${APPDEST}/cmd/lib/data-purge.sh"
+else
+    fail "缺少 lib/data-purge.sh（fpk 打包不完整），已中止安装以免跳过"已有数据库"检测。"
+fi
+_last_action="$(head -n1 "${CFG_DIR}/last_uninstall_action" 2>/dev/null || true)"
+# 判定**只基于应用标准数据根** ${VAR_DIR}/data；外部自定义目录不由应用管理，不参与判定、不会被删除。
+if command -v standard_root_has_db >/dev/null 2>&1 && standard_root_has_db "${DATA_ROOT}"; then
+    _real="$(readlink -f "${DATA_ROOT}" 2>/dev/null || echo "${DATA_ROOT}")"
+    if [ "${_last_action}" = "delete" ] && [ -e "${DATA_ROOT}" ]; then
+        fail "上一次卸载选择的是「删除数据」，但标准数据根 ${DATA_ROOT} 仍然存在（${_real}）——说明删除没有生效。
+已中止安装，避免沿用旧账号导致"新密码登不进"。
+请确认后重试（若 ${_real} 是你自建的外部目录，请把 ${DATA_ROOT} 这个链接删掉再装）。"
+    fi
+    say "⚠️ 检测到已有数据库（${_real}/pgdata）：**将沿用原有账号与密码**。"
+    say "   本次向导里填写的管理员密码**不会生效**（账号已存在）。"
+    if command -v standard_root_is_external >/dev/null 2>&1 && standard_root_is_external "${DATA_ROOT}"; then
+        say "   注意：${DATA_ROOT} 是指向外部目录的符号链接，该目录**不由应用管理**；"
+        say "   卸载时选「删除数据」也**不会删除它**（只会删链接）。"
+    fi
+    say "   **本次向导里的初始密码不适用**；请用原有密码登录（或用下面任一方式重置）。"
+    say "   忘记密码怎么办（三选一）："
+    say "     1) 设置页「重置管理员登录密码（立即生效）」"
+    say "     2) docker exec -e MFA_RESET_PASSWORD='新密码' ${APP_NAME} dotnet MailArchiver.dll --reset-password ${ADMIN_USER}"
+    say "     3) 网关故障时先解绑：docker exec ${APP_NAME} dotnet MailArchiver.dll --unbind ${ADMIN_USER}"
+    trace "existing pgdata detected (standard root); wizard password will not apply"
+else
+    say "未检测到已有数据库（标准数据根 ${DATA_ROOT} 不存在或为空）：本次向导填写的管理员密码将用于创建账号。"
+fi
+
+say "管理员账号  : ${ADMIN_USER}"
+say "时区        : ${TZ_ID}"
+verify_runtime_dirs
+# ---------------------------------------------------------------- R9（改）：保留可读副本 + 显式自检
+# 旧实现这里把 @appconf/admin_password 覆盖成"不可还原指纹"，
+# 又用一条含 `#` 的 sed（分隔符冲突 → 语法错误被 `|| true` 吞掉）把 app.env 的密码值写成了说明文字，
+# 结果是【用户再也无法知道自己的密码】。已按方案 A 修正：
+#   · admin_password 保留 600 明文（仅属主可读），并在安装日志里打印一次密码，供用户抄下；
+#   · 不再改写 app.env 的 Authentication__Password（保持与向导输入一致），并做格式自检。
+if [ -s "${CFG_DIR}/admin_password" ]; then
+    chmod 600 "${CFG_DIR}/admin_password" 2>/dev/null || true
+    _pw_len=$(( $(wc -c <"${CFG_DIR}/admin_password") - 1 ))
+    # MF-2/MF-3：只有"本次新建了数据库"才打印密码，且只打印**掩码**。
+    #   旧实现无条件打印明文 ⇒ ① 已有库时用户抄到的是"登不进去的密码"（本次事故原话）；
+    #                              ② 明文进安装日志，公开发布后一截图即泄露。
+    _existing_db=0
+    if command -v standard_root_has_db >/dev/null 2>&1 && standard_root_has_db "${DATA_ROOT}"; then _existing_db=1; fi
+    if [ "${_existing_db}" = "0" ]; then
+        _raw="$(head -n1 "${CFG_DIR}/admin_password")"
+        if [ "${#_raw}" -ge 4 ]; then
+            _masked="$(printf '%s' "${_raw}" | cut -c1-2)****$(printf '%s' "${_raw}" | rev | cut -c1-2 | rev)"
+        else
+            _masked="****"
+        fi
+        say "管理员密码已保存在 ${CFG_DIR}/admin_password（600，仅属主可读）。"
+        say "    用户名：${ADMIN_USER}"
+        say "    密码  ：${_masked}（**掩码**，完整口令请打开该文件查看；安装日志不写明文）"
+        say "（该文件含明文口令：备份/迁移时按敏感件保管；密码只存哈希、**无法查看，只能重置**）"
+    else
+        say "管理员密码副本：${CFG_DIR}/admin_password（600）。**本次沿用已有数据库，向导密码不生效**，请用原密码。"
+    fi
+    say "**首次登录会要求修改密码，属正常**（上游对初始密码的保护），改一次即可。"
+    say "忘记密码怎么办（三选一）："
+    say "  1) 设置页「重置管理员登录密码（立即生效）」"
+    say "  2) docker exec -e MFA_RESET_PASSWORD='新密码' ${APP_NAME} dotnet MailArchiver.dll --reset-password ${ADMIN_USER}"
+    say "  3) 网关故障无法进入时先解绑：docker exec ${APP_NAME} dotnet MailArchiver.dll --unbind ${ADMIN_USER}"
+else
+    warn "未找到 ${CFG_DIR}/admin_password，无法打印管理员密码；若登录失败请用 --reset-password 重置。"
+fi
+
+# 自检：app.env 里的 Authentication__Password 必须是"向导输入的那个值"，且不得是说明文字
+_env_pw="$(awk -F= '/^Authentication__Password=/{sub(/^Authentication__Password=/,""); print; exit}' "${APP_ENV}" 2>/dev/null)"
+_env_pw_len=${#_env_pw}
+case "${_env_pw}" in
+    *fingerprint*|*不可还原*|*"首次建号"*|*"改密见"*)
+        fail "app.env 的 Authentication__Password 被写成了说明文字（当前长度 ${_env_pw_len}）：${_env_pw}
+这是历史 bug（sed 分隔符冲突）。请用 --reset-password 重置密码，并修好 install_callback 后再装。"
+        ;;
+esac
+if [ -n "${ADMIN_PASS}" ] && [ "${_env_pw}" != "${ADMIN_PASS}" ]; then
+    fail "app.env 的 Authentication__Password 与向导输入不一致（长度 ${_env_pw_len} vs ${#ADMIN_PASS}）。"
+fi
+say "app.env 自检通过：Authentication__Password 长度=${_env_pw_len}（为空表示沿用库中哈希）"
+
+trace "install_callback ok"
+exit 0
