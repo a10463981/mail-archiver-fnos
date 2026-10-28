@@ -1,0 +1,25 @@
+[
+  {
+    "stepTitle": "卸载 邮件归档",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "关于数据：如果数据目录显示为存储空间里的路径（例如 /vol1/1000/MailArchive），卸载不会删除那里的任何数据，下面选「保留」或「删除」都不影响它——重新安装后到设置页把同一路径填回去即可继续使用。只有当数据在应用自有目录时才受下面的选择影响。"
+      },
+      {
+        "type": "tips",
+        "helpText": "配置与数据库密码会保留在应用配置目录，这样「卸载 → 重装」才能接着用原来的数据库。彻底清理请卸载后手动删除 /vol1/@appconf/mail-archiver-fnos。"
+      },
+      {
+        "type": "radio",
+        "field": "wizard_data_action",
+        "label": "应用自有目录里的数据处理",
+        "initValue": "keep",
+        "options": [
+          { "label": "保留数据（推荐，重装可继续用）", "value": "keep" },
+          { "label": "删除应用自有目录里的数据（不可恢复）", "value": "delete" }
+        ]
+      }
+    ]
+  }
+]
