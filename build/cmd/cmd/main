@@ -1,0 +1,73 @@
+#!/bin/bash
+# 服务控制：start / stop / status
+# status 退出码：0=运行中就绪 / 1=在跑但未就绪（socket 缺失或权限不对） / 3=未运行
+set -u
+
+APP_NAME=mail-archiver-fnos
+APPDEST="${TRIM_APPDEST}"
+VAR_DIR="${TRIM_PKGVAR}"
+CFG_DIR="${TRIM_PKGETC}"
+LOG_FILE="${TRIM_TEMP_LOGFILE:-${TRIM_PKGVAR:-/tmp}/lifecycle.log}"
+COMPOSE_FILE="${APPDEST}/docker/docker-compose.yaml"
+SOCK="${APPDEST}/app.sock"
+
+say() { echo "[${APP_NAME}] $*"; }
+fail() { echo "[${APP_NAME}] ERROR: $*" >>"${LOG_FILE}" 2>/dev/null || true; echo "[${APP_NAME}] ERROR: $*" >&2; exit 1; }
+warn() { echo "[${APP_NAME}] WARN: $*" >>"${LOG_FILE}" 2>/dev/null || true; echo "[${APP_NAME}] WARN: $*" >&2; }
+trace() { { mkdir -p "${VAR_DIR}" && echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"${VAR_DIR}/lifecycle.log"; } 2>/dev/null || true; }
+
+# socket 权限看护：容器自己会 chmod，这里再兜一层（真实应用换成 Kestrel 时尤其需要）
+watch_socket() {
+    (
+        i=0
+        while [ "$i" -lt 60 ]; do
+            i=$((i + 1))
+            if [ -S "${SOCK}" ]; then
+                mode="$(stat -c '%a' "${SOCK}" 2>/dev/null || echo '')"
+                if [ "${mode}" != "600" ]; then
+                    chmod 600 "${SOCK}" 2>/dev/null && echo "$(date '+%F %T') chmod 600 ${SOCK} (was ${mode})" >>"${VAR_DIR}/socket_perm.log"
+                fi
+                return 0
+            fi
+            sleep 1
+        done
+    ) >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+}
+
+case "${1:-}" in
+    start)
+        trace "main start"
+        [ -f "${COMPOSE_FILE}" ] || fail "compose 文件缺失：${COMPOSE_FILE}"
+        # 容器由应用中心托管启动；这里做一次幂等 up 保证读到当前 app.env（冷启动占位配置不会被沿用）
+        if docker compose version >/dev/null 2>&1; then
+            docker compose -p "${APP_NAME}" -f "${COMPOSE_FILE}" up -d >/dev/null 2>&1 || warn "compose up 未生效（应用中心可能已在启动）"
+        fi
+        watch_socket
+        say "start ok（socket 权限看护已挂起 60s）"
+        exit 0
+        ;;
+    stop)
+        trace "main stop"
+        exit 0
+        ;;
+    status)
+        running="$(docker inspect -f '{{.State.Running}}' "${APP_NAME}" 2>/dev/null)" || exit 3
+        [ "${running}" = "true" ] || exit 3
+        if [ ! -S "${SOCK}" ]; then
+            echo "[${APP_NAME}] status: 容器在跑但 ${SOCK} 不存在" >&2
+            exit 1
+        fi
+        mode="$(stat -c '%a' "${SOCK}" 2>/dev/null || echo '')"
+        if [ "${mode}" != "600" ]; then
+            warn "socket 权限为 ${mode}，正在收紧为 600"
+            chmod 600 "${SOCK}" 2>/dev/null || true
+        fi
+        db_running="$(docker inspect -f '{{.State.Running}}' "${APP_NAME}-db" 2>/dev/null || echo false)"
+        [ "${db_running}" = "true" ] || { echo "[${APP_NAME}] status: 数据库容器未运行" >&2; exit 1; }
+        exit 0
+        ;;
+    *)
+        fail "未知子命令：${1:-<空>}（支持 start|stop|status）"
+        ;;
+esac
