@@ -1,0 +1,30 @@
+#!/bin/bash
+# 升级前：记录当前镜像与版本，供 upgrade_callback 校验/回滚用
+set -u
+APP_NAME=mail-archiver-fnos
+CFG_DIR="${TRIM_PKGETC}"
+VAR_DIR="${TRIM_PKGVAR}"
+LOG_FILE="${TRIM_TEMP_LOGFILE:-${TRIM_PKGVAR:-/tmp}/lifecycle.log}"
+say() { echo "[${APP_NAME}] $*"; }
+warn() { echo "[${APP_NAME}] WARN: $*" >>"${LOG_FILE}" 2>/dev/null || true; echo "[${APP_NAME}] WARN: $*" >&2; }
+
+say "upgrade_init begin (${TRIM_OLD_APPVER:-?} -> ${TRIM_APPVER:-?})"
+mkdir -p "${CFG_DIR}" 2>/dev/null || true
+
+# 备份配置与数据根指针（数据本身不动）
+if [ -d "${CFG_DIR}" ]; then
+    bak="${TRIM_PKGTMP:-/tmp}/${APP_NAME}-prev-${TRIM_OLD_APPVER:-unknown}-$(date '+%Y%m%d%H%M%S').tgz"
+    tar -czf "${bak}" -C "${CFG_DIR}" . >/dev/null 2>&1 && say "已备份配置到 ${bak}" || warn "配置备份失败（继续）"
+fi
+
+# 记录当前运行镜像，升级后若镜像没变就提示
+cur_img="$(docker inspect -f '{{.Config.Image}}' "${APP_NAME}" 2>/dev/null || true)"
+printf '%s\n' "${cur_img}" >"${CFG_DIR}/previous_image"
+say "当前镜像：${cur_img:-<未运行>}"
+
+# 数据目录必须存在，否则升级会把空目录当成数据（等于"数据丢了"）
+if [ ! -d "${VAR_DIR}/data" ]; then
+    warn "数据根 ${VAR_DIR}/data 不存在！升级后应用会初始化新库，请先确认磁盘/链接是否正常。"
+fi
+say "upgrade_init ok"
+exit 0
