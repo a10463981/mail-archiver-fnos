@@ -1,0 +1,17 @@
+#!/bin/bash
+# 手工自检：逐项校验「挂载点 ↔ 宿主目录 ↔ 属主/权限」是否符合权威 compose。
+# 用法（在 fnOS 上以 root 或安装用户执行）：
+#   TRIM_UID=987 TRIM_GID=982 TRIM_PKGVAR=/vol1/@appdata/mail-archiver-fnos \
+#   DATA_ROOT=/vol1/@appdata/mail-archiver-fnos/data bash /var/apps/mail-archiver-fnos/cmd/verify_mounts
+set -u
+APP_NAME=mail-archiver-fnos
+VAR_DIR="${TRIM_PKGVAR:?TRIM_PKGVAR missing}"
+DATA_ROOT="${DATA_ROOT:-${VAR_DIR}/data}"
+LOG_FILE="${TRIM_TEMP_LOGFILE:-${VAR_DIR}/lifecycle.log}"
+say() { echo "[${APP_NAME}] $*"; }
+fail() { echo "[${APP_NAME}] ERROR: $*" >&2; exit 1; }
+
+LIB_DIRS="$(dirname "$0")/lib_runtime_dirs.sh"
+[ -r "${LIB_DIRS}" ] && . "${LIB_DIRS}" || fail "缺少 ${LIB_DIRS}"
+verify_runtime_dirs
+exit 0
