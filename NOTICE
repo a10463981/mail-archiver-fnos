@@ -1,0 +1,29 @@
+Mail-archiver for fnOS (mail-archiver-fnos)
+===========================================
+
+本仓库是 **Mail-archiver** 的 fnOS（飞牛 OS）打包修改分发版。
+
+上游项目
+  - 名称：Mail-archiver
+  - 仓库：https://github.com/s1t5/mail-archiver
+  - 基线提交：39f59d2
+  - 许可：GNU General Public License v3.0（GPL-3.0）
+
+本仓库的修改内容
+  - 全部修改以补丁形式提供，见 `patches/`（权威补丁：0029-fnos-fpk-p3.27.patch）
+  - 修改包括：fnOS 统一网关身份接入（免密/双通道）、中文界面与本地化、时间显示时区、
+    后台服务异常隔离、CLI 救援命令（--list/--unbind/--reset-password/--enable）、
+    以及 fpk 打包脚本（安装/升级/卸载/设置页/数据目录迁移与清理）
+  - 打包层（`build/`）为原创新增，不含上游代码
+
+分发声明
+  - 本仓库与其产出的 fpk 安装包同样以 **GPL-3.0** 分发（见 `LICENSE`）
+  - 安装包内含上游 GPL-3.0 程序的编译产物（容器镜像）。按 GPL-3.0 第 6 条，
+    对应源码可通过以下方式获得：
+      1) 上游：https://github.com/s1t5/mail-archiver （commit 39f59d2）
+      2) 本仓库：`patches/`（完整修改）+ `build/`（构建脚本与打包脚本）
+      3) 复现步骤：见 `build/rebuild.sh`（从上游源码 + 补丁构建同样的镜像与 fpk）
+
+免责
+  - 本分发版由第三方维护，与上游作者无关；上游作者不对本打包版提供支持。
+  - 使用前请自行评估风险并做好数据备份。
