@@ -1,0 +1,61 @@
+#!/bin/bash
+# 设置页保存前：备份配置 + 校验新值（失败即中止，不动现场）
+set -u
+
+APP_NAME=mail-archiver-fnos
+CFG_DIR="${TRIM_PKGETC}"
+VAR_DIR="${TRIM_PKGVAR}"
+LOG_FILE="${TRIM_TEMP_LOGFILE:-${TRIM_PKGVAR:-/tmp}/lifecycle.log}"
+
+say() { echo "[${APP_NAME}] $*"; }
+fail() { echo "[${APP_NAME}] ERROR: $*" >>"${LOG_FILE}" 2>/dev/null || true; echo "[${APP_NAME}] ERROR: $*" >&2; exit 1; }
+warn() { echo "[${APP_NAME}] WARN: $*" >>"${LOG_FILE}" 2>/dev/null || true; echo "[${APP_NAME}] WARN: $*" >&2; }
+
+say "config_init begin"
+
+# 备份现值（改坏了能从这个 tgz 捞回来）
+mkdir -p "${TRIM_PKGTMP:-/tmp}" 2>/dev/null || true
+if [ -d "${CFG_DIR}" ]; then
+    bak="${TRIM_PKGTMP:-/tmp}/${APP_NAME}-etc-$(date '+%Y%m%d%H%M%S').tgz"
+    if tar -czf "${bak}" -C "${CFG_DIR}" . >/dev/null 2>&1; then
+        say "已备份配置到 ${bak}"
+    else
+        warn "配置备份失败（继续）"
+    fi
+fi
+
+# 校验：数据目录
+case "${wizard_data_mode:-keep}" in
+    custom)
+        [ -n "${wizard_data_dir:-}" ] || fail "选择「改到指定目录」时必须填写路径。"
+        case "${wizard_data_dir}" in
+            /vol[0-9]*|/vol[0-9]*/) ;;
+            *) fail "数据目录必须位于存储空间（/volN/...），当前：${wizard_data_dir}" ;;
+        esac
+        [ -d "${wizard_data_dir}" ] || fail "数据目录不存在：${wizard_data_dir}"
+        [ -w "${wizard_data_dir}" ] || fail "数据目录不可写：${wizard_data_dir}
+请先在「应用设置 → 访问权限」里把该目录授权给本应用，再回来保存。"
+        ;;
+    default|keep) ;;
+    *) fail "未知的数据目录选项：${wizard_data_mode}" ;;
+esac
+
+# 校验：时区
+tz="${wizard_timezone:-}"
+if [ -n "${tz}" ]; then
+    case "${tz}" in
+        *[!A-Za-z0-9_/+-]*) fail "时区格式非法：${tz}" ;;
+    esac
+    if [ -d /usr/share/zoneinfo ] && [ ! -f "/usr/share/zoneinfo/${tz}" ]; then
+        fail "未知时区：${tz}（例：Asia/Shanghai、UTC）"
+    fi
+fi
+
+# 校验：新密码（留空=不改）
+np="${wizard_admin_password:-}"
+if [ -n "${np}" ]; then
+    [ "${#np}" -ge 8 ] || fail "新密码至少 8 位。"
+fi
+
+say "config_init ok"
+exit 0
