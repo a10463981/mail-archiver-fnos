@@ -1,0 +1,67 @@
+[
+  {
+    "stepTitle": "数据目录（保存后需在应用中心重启一次才生效）",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "【先授权，再切换】要改数据目录，请先到「应用设置 → 访问权限」把目标目录授权给本应用，再回这里填写同一个路径；否则会报「数据目录不可写」。\n【保存后需重启】本页保存后配置不会立即生效，需到应用中心点一次「停止 → 启动」；这样做是为了不打断正在使用应用的人。"
+      },
+      {
+        "type": "select",
+        "field": "wizard_data_mode",
+        "label": "数据目录",
+        "initValue": "keep",
+        "options": [
+          { "label": "不修改（保持现在的位置）", "value": "keep" },
+          { "label": "改到下面的存储空间目录", "value": "custom" },
+          { "label": "恢复默认（应用自有目录）", "value": "default" }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_data_dir",
+        "label": "新的数据目录（仅选「改到」时填写）",
+        "initValue": "",
+        "rules": [
+          { "pattern": "^$|^/vol[0-9]+(/[A-Za-z0-9._\u4e00-\u9fa5-]+)+$", "message": "请填完整绝对路径，例如 /vol1/1000/MailArchive" }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "切换只改「以后写到哪里」，不搬数据。旧目录内容仍在原地，确认无误后请自行清理。改完会重建容器，服务中断约 10–30 秒。"
+      }
+    ]
+  },
+  {
+    "stepTitle": "管理员密码",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "留空 = 不修改。改密码会重建容器，已登录的浏览器会话需要重新登录一次。"
+      },
+      {
+        "type": "password",
+        "field": "wizard_admin_password",
+        "label": "新的管理员密码（留空 = 不修改）",
+        "initValue": "",
+        "rules": [
+          { "pattern": "^$|^.{8,128}$", "message": "至少 8 个字符；留空表示不修改" }
+        ]
+      }
+    ]
+  },
+  {
+    "stepTitle": "时区",
+    "items": [
+      {
+        "type": "text",
+        "field": "wizard_timezone",
+        "label": "显示时区（留空 = 不修改）",
+        "initValue": "",
+        "rules": [
+          { "pattern": "^$|^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+)*$", "message": "例如 Asia/Shanghai 或 UTC" }
+        ]
+      }
+    ]
+  }
+]
