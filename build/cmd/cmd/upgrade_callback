@@ -1,0 +1,65 @@
+#!/bin/bash
+# 升级后：确认单容器真起来了、socket 在、数据目录还在
+set -u
+APP_NAME=mail-archiver-fnos
+CFG_DIR="${TRIM_PKGETC}"
+VAR_DIR="${TRIM_PKGVAR}"
+APPDEST="${TRIM_APPDEST}"
+LOG_FILE="${TRIM_TEMP_LOGFILE:-${TRIM_PKGVAR:-/tmp}/lifecycle.log}"
+say() { echo "[${APP_NAME}] $*"; }
+fail() { echo "[${APP_NAME}] ERROR: $*" >&2; exit 1; }
+warn() { echo "[${APP_NAME}] WARN: $*" >>"${LOG_FILE}" 2>/dev/null || true; echo "[${APP_NAME}] WARN: $*" >&2; }
+trace() { { mkdir -p "${VAR_DIR}" && echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"${VAR_DIR}/lifecycle.log"; } 2>/dev/null || true; }
+
+trace "upgrade_callback begin (${TRIM_OLD_APPVER:-?} -> ${TRIM_APPVER:-?})"
+
+# 载荷升级后会被新包的占位文件覆盖：从 @appconf 恢复真实配置
+if [ -s "${CFG_DIR}/app.env" ]; then
+    install -m 600 "${CFG_DIR}/app.env" "${APPDEST}/docker/app.env" 2>/dev/null \
+        && say "已恢复 app.env 到载荷" || warn "恢复 app.env 失败"
+fi
+if [ -s "${CFG_DIR}/pg_password" ]; then
+    install -m 600 "${CFG_DIR}/pg_password" "${APPDEST}/docker/pg_password" 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------- 运行期目录（权威：cmd/lib_runtime_dirs.sh）
+LIB_DIRS="$(dirname "$0")/lib_runtime_dirs.sh"
+if [ -r "${LIB_DIRS}" ]; then
+    . "${LIB_DIRS}"
+else
+    fail "缺少 ${LIB_DIRS}（fpk 打包不完整）"
+fi
+
+
+ensure_runtime_dirs
+
+# chmod 兜底（真实应用换成 Kestrel 后可能忘记收权限）
+sock="${APPDEST}/app.sock"
+i=0
+while [ ! -S "${sock}" ] && [ "$i" -lt 60 ]; do i=$((i + 1)); sleep 2; done
+if [ -S "${sock}" ]; then chmod 600 "${sock}"; say "socket ok: $(ls -l "${sock}")"; else warn "60s 内未见 ${sock}，应用可能未启动。"; fi
+
+if [ -d "${VAR_DIR}/data/pgdata" ]; then
+    say "数据目录保留：${VAR_DIR}/data -> $(readlink "${VAR_DIR}/data" 2>/dev/null || echo '(自身)')"
+else
+    warn "未找到 ${VAR_DIR}/data/pgdata，请检查数据是否被清空。"
+fi
+
+new_img="$(docker inspect -f '{{.Config.Image}}' "${APP_NAME}" 2>/dev/null || true)"
+old_img="$(head -n1 "${CFG_DIR}/previous_image" 2>/dev/null || true)"
+if [ -n "${old_img}" ] && [ "${old_img}" = "${new_img}" ]; then
+    warn "升级后容器镜像未变化（仍是 ${new_img}）：可能没有拉取新镜像，或 compose 里 image 未更新。"
+fi
+say "升级完成：${TRIM_OLD_APPVER:-?} -> ${TRIM_APPVER:-?}（镜像 ${new_img:-未知}）"
+# ---------------------------------------------------------------- R5：PG 大版本一致性
+# pgdata 只与创建它的大版本兼容；跨大版本启动会直接失败（用户表现为"升级后起不来"）。
+_pg_major="$(docker exec mail-archiver-fnos-db psql -U mailarchiver -tAc 'show server_version_num' 2>/dev/null | tr -d ' ' | cut -c1-2)"
+if [ -n "${_pg_major}" ] && [ "${_pg_major}" != "16" ]; then
+    warn "检测到 PostgreSQL 大版本为 ${_pg_major}，本包按 16 构建；跨大版本请先 pg_dump 再 pg_restore（详见 README）。"
+else
+    say "PostgreSQL 大版本：${_pg_major:-未知}（期望 16）"
+fi
+
+verify_runtime_dirs
+trace "upgrade_callback ok"
+exit 0
