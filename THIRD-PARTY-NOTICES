@@ -1,0 +1,29 @@
+第三方组件声明（Third-Party Notices）
+=====================================
+
+本项目的 fpk 安装包含以下第三方组件（均按其各自许可分发）：
+
+1. Mail-archiver（上游应用）
+   - 许可：GPL-3.0
+   - 仓库：https://github.com/s1t5/mail-archiver （commit 39f59d2）
+
+2. .NET 运行时 / ASP.NET Core（.NET 10）
+   - 许可：MIT
+   - 项目：https://github.com/dotnet/runtime 、https://github.com/dotnet/aspnetcore
+
+3. PostgreSQL 16（容器镜像 postgres:16-alpine）
+   - 许可：PostgreSQL License（类似 BSD/MIT）
+   - 项目：https://www.postgresql.org/about/licence/
+
+4. Alpine Linux（基础镜像）
+   - 许可：多种（主要为 MIT/BSD/GPL 组合）
+   - 项目：https://alpinelinux.org/
+
+5. Bootstrap / Bootstrap Icons（界面框架，经上游引入）
+   - 许可：MIT
+   - 项目：https://github.com/twbs/bootstrap 、https://github.com/twbs/icons
+
+6. 其它经上游引入的 NuGet 包：其许可随上游仓库一并提供，见上游 `Directory.Packages.props`
+   与各包自身的 LICENSE。
+
+如发现遗漏或标注有误，请在本仓库提 issue，我们会尽快更正。
