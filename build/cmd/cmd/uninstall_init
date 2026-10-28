@@ -1,0 +1,9 @@
+#!/bin/bash
+# 卸载前：只做信息提示，不修改任何东西
+set -u
+APP_NAME=mail-archiver-fnos
+VAR_DIR="${TRIM_PKGVAR}"
+say() { echo "[${APP_NAME}] $*"; }
+say "uninstall_init: 即将卸载（数据根 ${VAR_DIR}/data 将按向导选择处理）"
+say "uninstall_init ok"
+exit 0
