@@ -30,4 +30,4 @@
 因此应用只监听 **`/var/apps/<app>/target/app.sock`**（`target → @appcenter/<app>`）。旧版曾把 socket 写到 `@appcenter` 裸路径，网关按 `target/app.sock` 解析时可能失败 → **页面 404**。**不要改回非 target 路径。**
 
 ## 官方 API（为什么不接）
-`trim.file.checkUserACL` / `convertPath` / `getPlatformConfig` 实测返回 `200006 Internal Error`（当前系统不可用），且需要 `config/resource` 声明 `api-scope` + App≥1.34.0。改用 `data-share` 后**也已经不需要**它们。详见 `docs/FNOS-API-RESEARCH.md`。
+`trim.file.checkUserACL` / `convertPath` / `getPlatformConfig` 实测返回 `200006 Internal Error`（当前系统不可用），且需要 `config/resource` 声明 `api-scope` + App≥1.34.0。改用 `data-share` 后**也已经不需要**它们。（研究记录未随本仓库发布。）
