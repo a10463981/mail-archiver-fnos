@@ -328,7 +328,7 @@ if command -v standard_root_has_db >/dev/null 2>&1 && standard_root_has_db "${DA
 已中止安装，避免沿用旧账号导致"新密码登不进"。
 请确认后重试（若 ${_real} 是你自建的外部目录，请把 ${DATA_ROOT} 这个链接删掉再装）。"
     fi
-    say "⚠️ 检测到已有数据库（${_real}/pgdata）：**将沿用原有账号与密码**。"
+    say "【态②·沿用】检测到已有数据库（${_real}/pgdata）：**将沿用原有账号与密码，本次向导里的密码不生效**。"
     say "   本次向导里填写的管理员密码**不会生效**（账号已存在）。"
     if command -v standard_root_is_external >/dev/null 2>&1 && standard_root_is_external "${DATA_ROOT}"; then
         say "   注意：${DATA_ROOT} 是指向外部目录的符号链接，该目录**不由应用管理**；"
@@ -341,7 +341,7 @@ if command -v standard_root_has_db >/dev/null 2>&1 && standard_root_has_db "${DA
     say "     3) 网关故障时先解绑：docker exec ${APP_NAME} dotnet MailArchiver.dll --unbind ${ADMIN_USER}"
     trace "existing pgdata detected (standard root); wizard password will not apply"
 else
-    say "未检测到已有数据库（标准数据根 ${DATA_ROOT} 不存在或为空）：本次向导填写的管理员密码将用于创建账号。"
+    say "【态③·初始化】**首次创建**：标准数据根 ${DATA_ROOT} 无数据库内容，将用**本次向导密码**初始化新库并创建管理员账号（首登会要求改密）。"
 fi
 
 say "管理员账号  : ${ADMIN_USER}"
