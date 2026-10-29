@@ -6,5 +6,12 @@
         "path": "docker"
       }
     ]
+  },
+  "data-share": {
+    "shares": [
+      {
+        "name": "mail-archiver/data"
+      }
+    ]
   }
 }

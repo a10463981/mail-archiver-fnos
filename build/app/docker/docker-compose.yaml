@@ -4,7 +4,8 @@
 # （recon/fnos-fpk-p1/docker-compose.fnos.yaml）以本文件为准对齐。
 #
 # 四条硬约束（改前必读）：
-#   1) 不 publish 任何 TCP 端口。应用只通过 /var/apps/<app>/target/app.sock(=@appcenter/<app>/app.sock) 暴露给网关；
+#   1) 不 publish 任何 TCP 端口。官方规范：gatewaySocket 只填文件名，转发目标固定 /var/apps/<app>/target/app.sock
+#      （target 是平台给的符号链接 → @appcenter/<app>）。容器内 LISTEN=/var/apps/<app>/target/app.sock
 #      一旦发布端口，局域网任何进程都能伪造 X-Trim-Isadmin 冒充管理员（已实测）。
 #   2) 容器一律以 ${TRIM_UID}:${TRIM_GID} 运行（非 root）。凡 bind mount 进容器的宿主目录，
 #      属主必须是 TRIM_UID —— 否则 DataProtection 写不了 keyring → 每次重启换密钥 → 全员掉线

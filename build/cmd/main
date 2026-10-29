@@ -41,6 +41,14 @@ case "${1:-}" in
     start)
         trace "main start"
         ensure_payload_docker_dir
+
+# 0.1.25（官方 data-share）：若平台注入了共享目录，且当前数据根未指向它，只提示、不在运行期迁移
+_share="${TRIM_DATA_SHARE_PATHS%%:*}"
+if [ -n "${_share}" ] && [ -d "${_share}" ] && [ -L "${TRIM_PKGVAR}/data" ]; then
+    _cur="$(readlink -f "${TRIM_PKGVAR}/data" 2>/dev/null)"
+    [ "${_cur}" = "$(readlink -f "${_share}" 2>/dev/null)" ] \
+        || say "提示：系统共享目录 ${_share} 未被使用（当前数据根 ${_cur}）。如需切换请卸载（保留数据）后重装。" 
+fi
         [ -f "${COMPOSE_FILE}" ] || fail "compose 文件缺失：${COMPOSE_FILE}"
         # 容器由应用中心托管启动；这里做一次幂等 up 保证读到当前 app.env（冷启动占位配置不会被沿用）
         if docker compose version >/dev/null 2>&1; then
