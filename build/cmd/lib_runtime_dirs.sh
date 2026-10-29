@@ -232,6 +232,17 @@ ensure_payload_docker_dir() {
             (umask 077; LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32 >"${dst}/pg_password") 2>/dev/null && need="${need} pg_password(新生成)"
         fi
     fi
+    # 0.1.23：纠正 app.env 的 socket 落点（必须 @appcenter；旧版写 APPDEST 会绑定失败）
+    _want="${APPCENTER:-/vol1/@appcenter/${app}}/app.sock"
+    if [ -s "${dst}/app.env" ]; then
+        _cur="$(grep -m1 '^LISTEN_UNIX_SOCKET=' "${dst}/app.env" 2>/dev/null | cut -d= -f2-)"
+        if [ -n "${_cur}" ] && [ "${_cur}" != "${_want}" ]; then
+            sed -i "s|^LISTEN_UNIX_SOCKET=.*|LISTEN_UNIX_SOCKET=${_want}|" "${dst}/app.env" 2>/dev/null || true
+            sed -i "s|^ASPNETCORE_URLS=http://unix:.*|ASPNETCORE_URLS=http://unix:${_want}|" "${dst}/app.env" 2>/dev/null || true
+            say "已纠正载荷 app.env 的 socket 落点：${_cur} → ${_want}"
+            need="${need} app.env(socket修正)"
+        fi
+    fi
     for f in app.env pg_password; do
         [ -f "${dst}/${f}" ] && { chown "${TRIM_UID:-987}:${TRIM_GID:-982}" "${dst}/${f}" 2>/dev/null || true; chmod 600 "${dst}/${f}" 2>/dev/null || true; }
     done

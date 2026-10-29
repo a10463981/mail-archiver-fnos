@@ -27,6 +27,16 @@ trace "install_callback begin (uid=$(id -u) user=$(id -un))"
 
 mkdir -p "${VAR_DIR}/logs" "${CFG_DIR}" "${DP_KEYS_DIR}" || fail "创建目录失败（${VAR_DIR} / ${CFG_DIR}）"
 
+# 0.1.23：socket 落点统一为 @appcenter 路径（网关与平台只认这个；写 APPDEST 会绑定失败/网关 502）。
+APP_CENTER_DIR="${TRIM_APPCENTER:-/vol1/@appcenter/mail-archiver-fnos}"
+SOCK_PATH="${APP_CENTER_DIR}/app.sock"
+
+# 0.1.23：数据目录校验必须在**本文件内**可用 can_write_as_app（它定义在 cmd/lib_runtime_dirs.sh）。
+# 旧实现用 `[ -w ]`：以 root 运行时“什么都可写”⇒ 未授权目录被误判为可写 → 迁移到一个应用写不进的目录
+# → 应用起不来（已实测复现）。此处提前 source，并改用它做“降权到运行用户”的真实可写探测。
+if [ -r "$(dirname "$0")/lib_runtime_dirs.sh" ]; then . "$(dirname "$0")/lib_runtime_dirs.sh"
+elif [ -r "${APPDEST}/cmd/lib_runtime_dirs.sh" ]; then . "${APPDEST}/cmd/lib_runtime_dirs.sh"; fi
+
 # ---------------------------------------------------------------- 业务数据根
 # 用户选了存储空间：先建符号链接（目标不可写就回落，不假装成功）
 data_mode="${wizard_data_mode:-keep}"      # keep|custom|default
@@ -40,9 +50,19 @@ case "${data_mode}" in
             /vol[0-9]*|/vol[0-9]*/) ;;
             *) fail "数据目录必须位于存储空间（/volN/...），当前：${data_target}" ;;
         esac
-        if [ ! -d "${data_target}" ] || [ ! -w "${data_target}" ]; then
-            fail "数据目录不可写：${data_target}
-请在「应用设置 → 访问权限」里把该目录授权给本应用（应用用户：${TRIM_UID}），再回来重试。"
+        _cw=0; command -v can_write_as_app >/dev/null 2>&1 && can_write_as_app "${data_target}" && _cw=1
+        [ -z "$_cw" ] && _cw=0
+        if [ ! -d "${data_target}" ] || [ "${_cw}" = "0" ]; then
+            fail "数据目录不可写：${data_target}（运行用户 ${TRIM_UID}:${TRIM_GID}）
+**首次安装时无法预先授权**（那时应用还不存在），所以按下面三步走：
+  1) 先用**默认目录**完成安装（向导里数据目录选「默认」）；
+  2) 装好后到「应用设置 → 访问权限」把 ${data_target} 授权给本应用；
+  3) 卸载（选择**保留数据**）→ 重新安装时再指定 ${data_target}。
+
+技术替代（任选其一，以 root 执行，跳过上面三步）：
+  A) sudo chown -R ${TRIM_UID}:${TRIM_GID} ${data_target} && sudo chmod 755 ${data_target}
+  B) sudo setfacl -R -m u:${TRIM_UID}:rwx -m d:u:${TRIM_UID}:rwx ${data_target}
+     （注意：部分存储卷 ACL 不被强制生效，优先用 A）"
         fi
         if [ -L "${DATA_ROOT}" ] && [ "${prev_target}" != "${data_target}" ]; then
             warn "数据根从 ${prev_target:-<无>} 切到 ${data_target}；旧目录内容不会自动搬迁。"
@@ -163,7 +183,7 @@ TZ_ID="${wizard_timezone:-Asia/Shanghai}"
 # 只走文件：compose 不做变量插值，密码/密钥不进命令行、不进 compose 文本
 (umask 077; cat >"${APP_ENV}" <<EOF
 # 由 ${APP_NAME}/cmd/install_callback 生成，勿手工编辑（改设置页会重新生成）
-LISTEN_UNIX_SOCKET=${APPDEST}/app.sock
+LISTEN_UNIX_SOCKET=${SOCK_PATH}
 PATH_BASE=/app/mail-archiver-fnos
 Gateway__Enabled=true
 Gateway__UserIdHeader=X-Trim-Userid
@@ -182,7 +202,7 @@ ConnectionStrings__DefaultConnection=Host=postgres;Port=5432;Database=mailarchiv
 ReleaseNotes__Enabled=false
 Logging__LogLevel__Default=Information
 # R13：这一行只是回落值（LISTEN_UNIX_SOCKET 缺失时才生效）；http://unix:/path 是 Kestrel 合法语法
-ASPNETCORE_URLS=http://unix:${APPDEST}/app.sock
+ASPNETCORE_URLS=http://unix:${SOCK_PATH}
 EOF
 ) || fail "写入 ${APP_ENV} 失败"
 chmod 600 "${APP_ENV}" 2>/dev/null || true
@@ -234,6 +254,12 @@ fi
 # compose 在 install_callback 之前就会被平台校验，所以载荷里必须自带一份占位 app.env / pg_password；
 # 这里用真实值覆盖它们（权威副本仍在 @appconf）。载荷与容器内路径一致（compose 把 ${TRIM_APPDEST} 挂到同名路径）。
 install -m 600 "${APP_ENV}"      "${APPDEST}/docker/app.env"      || fail "渲染 ${APPDEST}/docker/app.env 失败"
+# 0.1.23 自检：载荷 LISTEN_UNIX_SOCKET 必须等于网关路径，不符即中止
+_lus="$(grep -m1 '^LISTEN_UNIX_SOCKET=' "${APPDEST}/docker/app.env" 2>/dev/null | cut -d= -f2-)"
+if [ -n "${_lus}" ] && [ "${_lus}" != "${SOCK_PATH}" ]; then
+    fail "载荷 app.env 的 LISTEN_UNIX_SOCKET=${_lus} 与网关路径 ${SOCK_PATH} 不一致（应用会绑定失败/网关 502）。已中止安装。"
+fi
+say "socket 路径自检通过：${_lus:-<未设置>}"
 install -m 600 "${PG_PASS_FILE}" "${APPDEST}/docker/pg_password"  || fail "渲染 ${APPDEST}/docker/pg_password 失败"
 
 # ---------------------------------------------------------------- 运行期目录（权威：cmd/lib_runtime_dirs.sh）
