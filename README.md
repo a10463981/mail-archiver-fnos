@@ -2,6 +2,8 @@
 
 **Mail-archiver 的 fnOS（飞牛 NAS）打包版**：`.fpk` 一键安装，在 NAS 上归档、检索个人与团队邮件。
 
+> 当前版本：**26.10.01**（正式首发；版本号规则 `<上游发布线>.<我方发布序号>`，镜像基线上游 `39f59d2` = 官方 `26.10.1`）；对应表见 [`VERSION-MAP.md`](VERSION-MAP.md)。
+
 - 上游项目：[s1t5/mail-archiver](https://github.com/s1t5/mail-archiver)（作者 **s1t5**），基线 commit **`39f59d2`**
 - 本仓库是上游的 **fnOS 打包修改分发版**，修改内容全部以补丁形式给出（`patches/`），**按 GPL-3.0 分发**（见 [`LICENSE`](LICENSE)、[`NOTICE`](NOTICE)）
 - 打包/发布：**a10463981**
@@ -36,12 +38,14 @@
 
 ## 卸载：选「保留数据」还是「删除数据」
 
-| 卸载选项 | 应用自有目录 `@appdata/mail-archiver-fnos/data` | 系统共享目录（data-share） | 你的存储空间目录（若数据根是指向它的符号链接） | 重装后 |
+| 卸载选项 | 应用自有目录 `@appdata/mail-archiver-fnos/data` | 系统共享目录（data-share，`/vol1/@appshare/<app>/data`） | 你的存储空间目录（数据根是指向它的符号链接时） | 重装后 |
 |---|---|---|---|---|
-| **保留数据** | 保留（含旧数据库与账号） | **不删** | 保留链接与目标 | 沿用旧账号与旧密码；**向导密码不生效** |
-| **删除数据** | 删除（数据库/附件清空） | **不删**（用户可见的共享数据，误删代价高） | **只删符号链接本身，目标目录一个字节都不动** | 全新空库、全新账号 |
+| **保留数据** | 保留（含旧数据库与账号） | 安装脚本不删；**但平台侧行为不保证**，见下方提醒 | 保留链接与目标 | 沿用旧账号与旧密码；**向导密码不生效** |
+| **删除数据** | 删除（数据库/附件清空） | ⚠ **平台会把 data-share 一并删除** | **只删符号链接本身，目标目录一个字节都不动** | 全新空库、全新账号 |
 
-一句话：**「删除数据」删的永远是应用自己的东西；你自己目录里的数据只能你自己删。**
+> ⚠ **重要提醒（实测反馈）**：应用中心选「**删除数据**」时，平台会把 `data-share`（`/vol1/@appshare/<app>/data`）**一起删掉**；「**卸载保留数据**」对 share 目录也**不保证成立**。因此**卸载前务必先备份**（`pg_dump` 或整目录复制到你自己管理的位置）。
+
+一句话：**「删除数据」删的永远是应用自己的东西；你自己目录里的数据只能你自己删——但默认共享目录请当作会被删，先备份。**
 完整的卸载/升级语义见 [`docs/UPGRADE-UNINSTALL.md`](docs/UPGRADE-UNINSTALL.md) 与 [`docs/DATA-DIRECTION.md`](docs/DATA-DIRECTION.md)。
 
 ## 数据目录说明（改目录 ≠ 搬数据）
@@ -67,6 +71,8 @@
 | [`docs/DATA-DIR-SWITCH.md`](docs/DATA-DIR-SWITCH.md) | 数据目录范式（官方 `data-share`）与 socket 落点 |
 | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) | 日志位置、常见现象、健康指标 |
 | [`docs/KNOWN-ISSUES.md`](docs/KNOWN-ISSUES.md) | 已知问题清单与边界 |
+| [`docs/FORGOT-PASSWORD.md`](docs/FORGOT-PASSWORD.md) | 忘记密码 / 登录不上（含 CLI 兜底） |
+| [`docs/MULTI-DISK.md`](docs/MULTI-DISK.md) | 系统盘 + 数据盘的多磁盘摆放 |
 
 ## 许可与免责
 
