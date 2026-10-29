@@ -20,11 +20,11 @@
 
 ## 从 Releases 下载并安装（三步）
 
-1. 打开 [**Releases**](https://github.com/a10463981/mail-archiver-fnos/releases) → 选最新版本 → 下载 `mail-archiver-fnos-<版本>.fpk` 和 `SHA256SUM.txt`。
-2. **校验**（建议）：
+1. 打开 [**Releases**](https://github.com/a10463981/mail-archiver-fnos/releases)（当前只有 **`26.10.01`**）→ 下载 `mail-archiver-fnos-26.10.01.fpk` 和 `SHA256SUM.txt`。
+2. **校验**（建议，应为 `969a54cd…`）：
    ```bash
    sha256sum -c SHA256SUM.txt        # Linux / macOS
-   certutil -hashfile mail-archiver-fnos-<版本>.fpk SHA256   # Windows
+   certutil -hashfile mail-archiver-fnos-26.10.01.fpk SHA256   # Windows
    ```
 3. fnOS **应用中心 → 手动安装 → 选择 .fpk** → 向导填管理员账号 / 密码 / 时区 → 完成 → **启动** → 安装完成后从**桌面打开**应用。
 
@@ -32,7 +32,7 @@
 
 ## ⚠️ 安全提示
 
-- **安装日志会打印管理员口令，但为掩码形式**（如 `Ma****6!`），**完整明文只写在 `@appconf/mail-archiver-fnos/admin_password`（权限 600）**。
+- **安装日志里的管理员口令是掩码形式**（如 `Ma****6!`），不含明文；口令在库里**只存哈希，无法查看、只能重置**（应用设置 → 运行设置 → 管理员登录密码）。
 - **请勿截图或外传安装日志**；向他人求助排障时，先确认日志与截图中不含账号、口令、邮箱地址。
 - 应用日志查看：`docker logs --tail 200 mail-archiver-fnos`（**不是** `data/logs`，该目录未使用），详见 [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)。
 
@@ -40,10 +40,10 @@
 
 | 卸载选项 | 应用自有目录 `@appdata/mail-archiver-fnos/data` | 系统共享目录（data-share，`/vol1/@appshare/<app>/data`） | 你的存储空间目录（数据根是指向它的符号链接时） | 重装后 |
 |---|---|---|---|---|
-| **保留数据** | 保留（含旧数据库与账号） | 安装脚本不删；**但平台侧行为不保证**，见下方提醒 | 保留链接与目标 | 沿用旧账号与旧密码；**向导密码不生效** |
+| **保留数据** | 保留（含旧数据库与账号） | 保留 | 保留链接与目标 | 沿用旧账号与旧密码；**向导密码不生效** |
 | **删除数据** | 删除（数据库/附件清空） | ⚠ **平台会把 data-share 一并删除** | **只删符号链接本身，目标目录一个字节都不动** | 全新空库、全新账号 |
 
-> ⚠ **重要提醒（实测反馈）**：应用中心选「**删除数据**」时，平台会把 `data-share`（`/vol1/@appshare/<app>/data`）**一起删掉**；「**卸载保留数据**」对 share 目录也**不保证成立**。因此**卸载前务必先备份**（`pg_dump` 或整目录复制到你自己管理的位置）。
+> ⚠ **重要提醒（实测）**：应用中心选「**删除数据**」时，平台会把 `data-share`（`/vol1/@appshare/<app>/data`）**一起删掉**（实测 `MAINEVENT DeleteFile`），安装脚本无法拦截。因此**卸载前务必先备份**（`pg_dump` 或整目录复制到你自己管理的位置）。
 
 一句话：**「删除数据」删的永远是应用自己的东西；你自己目录里的数据只能你自己删——但默认共享目录请当作会被删，先备份。**
 完整的卸载/升级语义见 [`docs/UPGRADE-UNINSTALL.md`](docs/UPGRADE-UNINSTALL.md) 与 [`docs/DATA-DIRECTION.md`](docs/DATA-DIRECTION.md)。
@@ -73,8 +73,13 @@
 | [`docs/KNOWN-ISSUES.md`](docs/KNOWN-ISSUES.md) | 已知问题清单与边界 |
 | [`docs/FORGOT-PASSWORD.md`](docs/FORGOT-PASSWORD.md) | 忘记密码 / 登录不上（含 CLI 兜底） |
 | [`docs/MULTI-DISK.md`](docs/MULTI-DISK.md) | 系统盘 + 数据盘的多磁盘摆放 |
+| [`docs/README-zh.md`](docs/README-zh.md) | 中文总览（版本事实、安装、数据、密码、日志） |
 
 ## 许可与免责
 
 - 本仓库与其产出的 `.fpk` 均以 **GNU GPL-3.0** 分发；安装包内含上游程序的编译产物，对应源码获取方式见 [`NOTICE`](NOTICE)。
 - 本分发版由第三方（a10463981）维护，**与上游作者无关**，上游作者不对本打包版提供支持。使用前请自行评估风险并做好数据备份。
+
+---
+
+最后更新：**26.10.01**（镜像 `zh-39f59d2-p30`，fpk 149,546,782 B，sha256 `969a54cd…`）
