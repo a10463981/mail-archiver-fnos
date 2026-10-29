@@ -44,8 +44,15 @@ if [ "${action}" = "delete" ]; then
         trace "uninstall_callback: purge refused/failed"
         exit 1
     fi
+    # 0.1.20（方案 B）："删除数据"=真干净 —— 一并清掉"记住的个人目录"记忆，
+    # 否则重装时 install_callback 会按 data_target 把链接又接回旧目录（用户已反馈该语义不一致）。
+    if [ -f "${CFG_DIR}/data_target" ]; then
+        rm -f "${CFG_DIR}/data_target" 2>/dev/null || true
+        say "已清除「记住的数据目录」记忆（重装将使用默认数据根）。"
+    fi
     rm -rf "${VAR_DIR}/logs" 2>/dev/null || true
     say "已删除日志目录 ${VAR_DIR}/logs"
+    say "已删除应用自有数据目录与目录记忆；**你在存储空间（/volN/...）下的个人目录不会被删除**。"
     if [ -L "${data_root}" ]; then
         say "已删除应用的标准数据目录与符号链接；**你在存储空间自定义的数据目录保持不动**（应用不管理它）。"
     else

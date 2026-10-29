@@ -66,6 +66,12 @@ case "${data_mode}" in
             # 上一次装到存储空间后，@appdata 可能被"失败的安装"回滚清掉（已实测），
             # 这里按记住的路径把链接接回去，否则会看起来像"数据丢了"。
             remembered="$(head -n1 "${CFG_DIR}/data_target")"
+            # 0.1.20：失效记忆（目标不存在或不可写）一律忽略并按默认目录安装，避免把链接接回坏目录
+            if [ -n "${remembered}" ] && [ ! -d "${remembered}" -o ! -w "${remembered}" ]; then
+                rm -f "${CFG_DIR}/data_target" 2>/dev/null || true
+                say "已忽略失效的目录记忆：${remembered}（不存在或不可写），改用默认数据根。"
+                remembered=""
+            fi
             if [ -n "${remembered}" ] && [ -d "${remembered}" ] && [ "${remembered}" != "${DATA_ROOT}" ]; then
                 # R1：这里只可能是空壳/占位目录；仍不 rm -rf，有内容就 mv 到 .bak
                 if [ -d "${DATA_ROOT}" ] && [ -n "$(ls -A "${DATA_ROOT}" 2>/dev/null)" ]; then
