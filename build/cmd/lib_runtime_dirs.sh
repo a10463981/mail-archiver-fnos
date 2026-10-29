@@ -233,7 +233,7 @@ ensure_payload_docker_dir() {
         fi
     fi
     # 0.1.23：纠正 app.env 的 socket 落点（必须 @appcenter；旧版写 APPDEST 会绑定失败）
-    _want="/var/apps/${app}/target/app.sock"   # 0.1.25：官方网关转发目标（target 符号链接 → @appcenter）
+    _want="${APPCENTER:-/vol1/@appcenter/${app}}/app.sock"   # 0.1.26：实测绑 target 符号链接会 EADDRNOTAVAIL(99)，改绑其指向的真实路径（同一 inode）
     if [ -s "${dst}/app.env" ]; then
         _cur="$(grep -m1 '^LISTEN_UNIX_SOCKET=' "${dst}/app.env" 2>/dev/null | cut -d= -f2-)"
         if [ -n "${_cur}" ] && [ "${_cur}" != "${_want}" ]; then

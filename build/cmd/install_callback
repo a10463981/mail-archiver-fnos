@@ -31,7 +31,10 @@ mkdir -p "${VAR_DIR}/logs" "${CFG_DIR}" "${DP_KEYS_DIR}" || fail "创建目录�
 APP_CENTER_DIR="${TRIM_APPCENTER:-/vol1/@appcenter/mail-archiver-fnos}"
 # 0.1.25（官方规范）：gatewaySocket 只填文件名，网关转发目标固定 /var/apps/<app>/target/app.sock。
 # target 是平台给的符号链接 → @appcenter/<app>；容器内自挂 TRIM_APPDEST，故 target 路径两侧都成立。
-SOCK_PATH="/var/apps/${APP_NAME}/target/app.sock"
+# 0.1.26（实测回退）：绑 `/var/apps/<app>/target/app.sock` 在容器内会
+# SocketException(99) Cannot assign requested address（target 是符号链接，跨挂载点绑定失败）。
+# 网关按 target/app.sock 解析，而 target→@appcenter/<app>，所以绑 @appcenter 的**同一 inode**即可。
+SOCK_PATH="${APP_CENTER_DIR}/app.sock"
 
 # 0.1.23：数据目录校验必须在**本文件内**可用 can_write_as_app（它定义在 cmd/lib_runtime_dirs.sh）。
 # 旧实现用 `[ -w ]`：以 root 运行时“什么都可写”⇒ 未授权目录被误判为可写 → 迁移到一个应用写不进的目录
@@ -48,8 +51,29 @@ prev_target="$(readlink "${DATA_ROOT}" 2>/dev/null || true)"
 # 0.1.25（官方 data-share 范式）：安装时平台会自动创建 config/resource 声明的共享目录，
 # 并**自动为应用运行用户授 ACL**。因此数据根**优先**取 TRIM_DATA_SHARE_PATHS（第一个路径），
 # 不再需要用户去「应用设置 → 访问权限」授权目录、也不需要 chown 兜底。
+# 0.1.26：卸载时把凭据快照存在 <数据根>/.appstate/ —— 重装时回填到 @appconf，
+# 否则新生成的 pg_password 与旧库不匹配 → 28P01 起不来。
+_stash_src=""
+for _cand in "${DATA_ROOT}/.appstate" "$(readlink -f "${DATA_ROOT}" 2>/dev/null)/.appstate"; do
+    [ -f "${_cand}/pg_password" ] && _stash_src="${_cand}" && break
+done
+if [ -n "${_stash_src}" ]; then
+    for f in pg_password credential_encryption_key; do
+        [ -f "${_stash_src}/${f}" ] && cp -a "${_stash_src}/${f}" "${CFG_DIR}/${f}" 2>/dev/null || true
+    done
+    chown "${TRIM_UID}:${TRIM_GID}" "${CFG_DIR}/pg_password" "${CFG_DIR}/credential_encryption_key" 2>/dev/null || true
+    chmod 600 "${CFG_DIR}/pg_password" "${CFG_DIR}/credential_encryption_key" 2>/dev/null || true
+    say "已从数据根回填凭据快照（pg_password / credential_encryption_key）"
+fi
+
 _share="${TRIM_DATA_SHARE_PATHS%%:*}"
-if [ -n "${_share}" ] && [ -d "${_share}" ] && [ "${data_mode}" != "custom" ]; then
+# 0.1.26：**空 share 不得夺走已有库**。只有当 share 里已有数据库，或当前数据根本无库（全新安装）时才切过去。
+_share_has_db=0
+[ -n "${_share}" ] && [ -d "${_share}/pgdata" ] && [ -n "$(ls -A "${_share}/pgdata" 2>/dev/null)" ] && _share_has_db=1
+_cur_has_db=0
+[ -d "${DATA_ROOT}/pgdata" ] && [ -n "$(ls -A "${DATA_ROOT}/pgdata" 2>/dev/null)" ] && _cur_has_db=1
+if [ -n "${_share}" ] && [ -d "${_share}" ] && [ "${data_mode}" != "custom" ] \
+   && { [ "${_share_has_db}" = "1" ] || [ "${_cur_has_db}" = "0" ]; }; then
     if [ -L "${DATA_ROOT}" ] && [ "$(readlink -f "${DATA_ROOT}")" = "$(readlink -f "${_share}")" ]; then
         say "数据根已是系统分配的共享目录：${_share}（data-share，无需授权）"
     else
@@ -64,6 +88,9 @@ if [ -n "${_share}" ] && [ -d "${_share}" ] && [ "${data_mode}" != "custom" ]; t
     fi
     printf "%s\n" "${_share}" > "${CFG_DIR}/data_target" 2>/dev/null || true
     data_mode="share"
+elif [ -n "${_share}" ] && [ "${_cur_has_db}" = "1" ] && [ "${_share_has_db}" = "0" ]; then
+    warn "系统共享目录 ${_share} 是空的，而当前数据根已有数据库 → **保留现有数据**（不切到空 share）。"
+    warn "   若确实要迁到 share：先卸载（保留数据），把旧数据复制到 ${_share} 后重装，或手工迁移 pgdata。"
 fi
 
 case "${data_mode}" in
@@ -280,7 +307,7 @@ install -m 600 "${APP_ENV}"      "${APPDEST}/docker/app.env"      || fail "渲�
 # 0.1.23 自检：载荷 LISTEN_UNIX_SOCKET 必须等于网关路径，不符即中止
 _lus="$(grep -m1 '^LISTEN_UNIX_SOCKET=' "${APPDEST}/docker/app.env" 2>/dev/null | cut -d= -f2-)"
 if [ -n "${_lus}" ] && [ "${_lus}" != "${SOCK_PATH}" ]; then
-    fail "载荷 app.env 的 LISTEN_UNIX_SOCKET=${_lus} 与官方网关转发目标 ${SOCK_PATH} 不一致（应用会绑定失败/网关 404）。已中止安装。"
+    fail "载荷 app.env 的 LISTEN_UNIX_SOCKET=${_lus} 与网关实际解析路径 ${SOCK_PATH}（target→@appcenter 同一 inode）不一致（会绑定失败/404）。已中止安装。"
 fi
 say "socket 路径自检通过：${_lus:-<未设置>}"
 install -m 600 "${PG_PASS_FILE}" "${APPDEST}/docker/pg_password"  || fail "渲染 ${APPDEST}/docker/pg_password 失败"

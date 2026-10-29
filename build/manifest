@@ -1,5 +1,5 @@
 appname               = mail-archiver-fnos
-version               = 0.1.25
+version               = 0.1.26
 display_name          = 邮件归档
 desc                  = <p>Mail-archiver 邮件归档与检索服务（中文版）。</p><p>从桌面图标打开即免二次登录：应用通过 fnOS 统一网关读取当前登录用户身份，首次进入时输入一次 Mail-archiver 账户密码完成绑定，之后自动登录。</p><p>数据默认存在应用自有目录，可在「应用设置」里改到你自己的存储空间（需先在「访问权限」里把目录授权给本应用）。</p>
 source                = thirdparty
@@ -14,5 +14,5 @@ desktop_applaunchname = mail-archiver-fnos.Application
 checkport             = false
 disable_authorization_path = true
 os_min_version        = 1.2.0401
-changelog             = 0.1.25: 改用官方 data-share(安装自动创建并授权数据目录，无需再手动授权/二次重装)；socket 落点改回官方 target 路径(修 404)
+changelog             = 0.1.26: 修 socket 绑定失败(回退@appcenter，同一inode)；残留判定改按目标内容(空目录/断链=干净)且不再删载荷；空share不夺走已有库；卸载清配置并快照凭据；精导向导文案
 checksum              = __CHECKSUM__

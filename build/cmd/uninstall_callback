@@ -31,6 +31,18 @@ data_root="${VAR_DIR}/data"
 real_target="$(readlink "${data_root}" 2>/dev/null || echo "")"
 
 say "数据根：${data_root}${real_target:+ -> ${real_target}}"
+
+# 0.1.26：平台会因 @appconf/@appdata 里还有文件而报"存在安装历史/没卸载干净"。
+# 做法：把**重装必需**的三件存进数据根下的 .appstate/，再清空 @appconf 的应用自有文件。
+_stash="${real_target:-${data_root}}/.appstate"
+if mkdir -p "${_stash}" 2>/dev/null; then
+    for f in pg_password credential_encryption_key data_target; do
+        [ -f "${CFG_DIR}/${f}" ] && cp -a "${CFG_DIR}/${f}" "${_stash}/${f}" 2>/dev/null || true
+    done
+    chown -R "${TRIM_UID}:${TRIM_GID}" "${_stash}" 2>/dev/null || true
+    chmod 700 "${_stash}" 2>/dev/null || true
+    say "已把重装必需的凭据快照保存到 ${_stash}（重装时自动回填）"
+fi
 # 记录本次卸载动作，供 install_callback 判断"用户刚选过删除数据"（见安装侧的 fail 分支）
 printf '%s\n' "${action}" >"${CFG_DIR}/last_uninstall_action" 2>/dev/null || true
 
@@ -76,3 +88,20 @@ say "已清理运行时密钥缓存 ${VAR_DIR}/DataProtection-Keys（配置与�
 
 trace "uninstall_callback ok"
 exit 0
+
+# 0.1.26：清空应用自有配置（避免平台判"未卸载干净"）；last_uninstall_action 保留给安装侧读取
+if [ -d "${CFG_DIR}" ]; then
+    for f in "${CFG_DIR}"/*; do
+        [ -e "${f}" ] || continue
+        case "$(basename "$f")" in
+            last_uninstall_action) continue ;;
+        esac
+        rm -rf "$f" 2>/dev/null || true
+    done
+    say "已清理应用自有配置目录（保留卸载动作标记）：${CFG_DIR}"
+fi
+# @appdata 下非数据文件（日志/上传/密钥环/备份壳）也清掉；**data 与 share 不动**
+for f in "${VAR_DIR}/logs" "${VAR_DIR}/uploads" "${VAR_DIR}/exports" "${VAR_DIR}/DataProtection-Keys"; do
+    [ -e "$f" ] && rm -rf "$f" 2>/dev/null || true
+done
+for f in "${VAR_DIR}"/data.bak-*; do [ -e "$f" ] && rm -rf "$f" 2>/dev/null || true; done

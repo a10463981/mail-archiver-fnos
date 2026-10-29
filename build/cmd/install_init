@@ -18,11 +18,18 @@ say "install_init begin"
 #   平台卸载后常留下**空壳目录**（如 ${TRIM_APPTEMP}/<app>、/var/apps/<app>），
 #   旧实现用 `[ -d ]` 判存在 → 把空壳当残留，界面就报"未删干净"，用户只能手删。
 #   新实现一律用"内容是否为空"判断（`ls -A` / `find -mindepth 1 -print -quit`）。
-dir_has_content() {   # 0 = 有内容；1 = 空目录或不存在；符号链接单独算"有内容"
+dir_has_content() {   # 0 = 有内容；1 = 空/不存在 → 干净
     local p="$1"
-    [ -L "${p}" ] && return 0            # 链接本身即残留（目标不看）
-    [ -d "${p}" ] || return 1            # 不存在或非目录 → 不算残留
-    [ -n "$(ls -A "${p}" 2>/dev/null)" ] || return 1   # 空目录 → 干净
+    # 0.1.26：符号链接**按目标内容**判定（旧实现"是链接就算残留"会在 data→share 之后
+    # 让每次重装都报"没卸载干净"：安装后 @appdata/<app>/data 必然是指向 share 的链接）
+    if [ -L "${p}" ]; then
+        [ -e "${p}" ] || return 1                     # 断链（目标没了）→ 干净
+        [ -d "${p}" ] || return 0                     # 指向普通文件 → 算有内容
+        [ -n "$(ls -A "${p}" 2>/dev/null)" ] || return 1   # 指向空目录 → 干净
+        return 0
+    fi
+    [ -d "${p}" ] || return 1
+    [ -n "$(ls -A "${p}" 2>/dev/null)" ] || return 1
     return 0
 }
 
@@ -51,13 +58,10 @@ clean_app_residue() {
         if docker ps --format '{{.Names}}' 2>/dev/null | grep -qE "^${app}(-db)?$"; then
             say "提示：${ac}/${app} 有内容但本应用容器仍在运行，跳过清理（请先在应用中心停止应用）。"
         elif dir_has_content "${ac}/${app}"; then
-            say "检测到陈旧运行时残留：${ac}/${app}（无运行中容器），正在清理…"
-            if find "${ac}/${app}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null; then
-                say "已清理 ${ac}/${app} 下的内容（目录本身保留，平台会重建）"
-                cleaned=1
-            else
-                blocked="${blocked}\n  ${ac}/${app}（清理失败，需要 root）"
-            fi
+            # 0.1.26：**不再自动删除** @appcenter/<app> —— 那是应用载荷（cmd/docker/ui…）。
+            # 之前这里 `rm -rf` 内容，正是"安装后 /var/apps/<app>/docker 凭空消失、下次重建必失败"的元凶。
+            say "提示：${ac}/${app} 内有上一版本的载荷文件（**不会自动删除**；平台安装时自行覆盖）。"
+            emptied="${emptied}\n  ${ac}/${app}（载荷，保留）"
         else
             say "运行时目录为空壳（无任何文件），**视为干净**：${ac}/${app}"
             emptied="${emptied}\n  ${ac}/${app}"
@@ -194,7 +198,7 @@ if [ -n "${data_pref}" ]; then
     if [ -d "${data_pref}" ] && [ -w "${data_pref}" ]; then
         say "自定义数据目录可写：${data_pref}"
     else
-        warn "自定义数据目录 ${data_pref} 当前不可写。若它位于存储空间，请先在「应用设置 → 访问权限」里把该目录授权给本应用，否则 install_callback 会回落到应用自有目录。"
+        warn "自定义数据目录 ${data_pref} 当前对运行用户 ${TRIM_UID} 不可写。**首次安装无法预先授权**，三步走：① 用默认目录装一次 ② 「应用设置 → 访问权限」授权该目录 ③ 卸载(保留数据)后重装时指定。或直接：sudo chown -R ${TRIM_UID}:${TRIM_GID} ${data_pref} && chmod 755 ${data_pref}（本卷 ACL 可能不生效，优先 chown）。install_callback 会回落到应用自有目录。"
     fi
 fi
 
