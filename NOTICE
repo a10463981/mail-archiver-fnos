@@ -10,7 +10,8 @@ Mail-archiver for fnOS (mail-archiver-fnos)
   - 许可：GNU General Public License v3.0（GPL-3.0）
 
 本仓库的修改内容
-  - 全部修改以补丁形式提供，见 `patches/`（权威补丁：0029-fnos-fpk-p3.27.patch）
+  - 全部修改以补丁形式提供，见 `patches/`（系列 0001–0030）；权威累积补丁：
+    0.1.16–0.1.28 用 `0029-fnos-fpk-p3.27.patch`，26.10.01 起用 `0030-fnos-fpk-p4.net.patch`
   - 修改包括：fnOS 统一网关身份接入（免密/双通道）、中文界面与本地化、时间显示时区、
     后台服务异常隔离、CLI 救援命令（--list/--unbind/--reset-password/--enable）、
     以及 fpk 打包脚本（安装/升级/卸载/设置页/数据目录迁移与清理）
