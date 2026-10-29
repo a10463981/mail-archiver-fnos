@@ -274,7 +274,7 @@ chmod 600 "${SETTINGS}" 2>/dev/null || true
 # ---------------------------------------------------------------- 镜像准备
 # 策略：包内 tar 优先（离线/慢网/中文镜像），否则走 fnOS 镜像站拉取。
 # 镜像只影响安装期，不参与运行期逻辑；中文版打成 mail-archiver-fnos:zh-<commit> 的 tar 即可。
-IMAGE_REF="$(head -n1 "${APPDEST}/docker/image.ref" 2>/dev/null || echo mail-archiver-fnos:zh-39f59d2)"
+IMAGE_REF="$(head -n1 "${APPDEST}/docker/image.ref" 2>/dev/null || echo mail-archiver-fnos:zh-39f59d2-p30)"
 IMAGE_TAR="$(ls "${APPDEST}"/images/*.tar 2>/dev/null | head -n1 || true)"
 
 if docker image inspect "${IMAGE_REF}" >/dev/null 2>&1; then

@@ -6,7 +6,7 @@ set -euo pipefail
 SRC="${1:?upstream source dir}"
 PATCHES="${2:?patch series dir}"
 OUT="${3:-$PWD/out}"
-TAG="mail-archiver-fnos:zh-39f59d2"
+TAG="mail-archiver-fnos:zh-39f59d2-p30"
 mkdir -p "$OUT"
 
 echo "== 1) 应用补丁（按序号，基线 upstream commit 39f59d2）=="
@@ -20,7 +20,7 @@ echo "== 2) 构建镜像（tag 必须与 fpk 内 docker/image.ref 一致：$TAG�
 docker build -t "$TAG" "$SRC"
 
 echo "== 3) 导出镜像 tar（放进 fpk 的 app/images/）=="
-docker save "$TAG" -o "$OUT/mail-archiver-fnos-zh-39f59d2.tar"
+docker save "$TAG" -o "$OUT/mail-archiver-fnos-zh-39f59d2-p30.tar"
 
 echo "== 4) 组装 fpk 源目录 =="
 #   build/cmd  build/config  build/wizard  build/app  build/ui  build/manifest  已在本仓库 build/ 下

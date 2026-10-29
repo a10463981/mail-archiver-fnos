@@ -145,7 +145,7 @@ fi
 # 若等到 init-docker 才准备，compose 会尝试 pull 并失败（实测：event=APP_INSTALL_FAILED_INIT_DOCKER_EXCEPTION）。
 # 因此在这里从"包解压目录"里把 images/*.tar 先 load 进本地 docker。
 APP_NAME=mail-archiver-fnos
-IMAGE_REF_DEFAULT="mail-archiver-fnos:zh-39f59d2"
+IMAGE_REF_DEFAULT="mail-archiver-fnos:zh-39f59d2-p30"
 
 preload_image() {
     tarball=""
