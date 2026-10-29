@@ -39,7 +39,7 @@ i=0
 while [ ! -S "${sock}" ] && [ "$i" -lt 60 ]; do i=$((i + 1)); sleep 2; done
 if [ -S "${sock}" ]; then chmod 600 "${sock}"; say "socket ok: $(ls -l "${sock}")"; else warn "60s 内未见 ${sock}，应用可能未启动。"; fi
 
-if [ -d "${VAR_DIR}/data/pgdata" ]; then
+if [ -d "${VAR_DIR}/data/pgdata" ] && [ -n "$(ls -A "${VAR_DIR}/data/pgdata" 2>/dev/null)" ]; then
     say "数据目录保留：${VAR_DIR}/data -> $(readlink "${VAR_DIR}/data" 2>/dev/null || echo '(自身)')"
 else
     warn "未找到 ${VAR_DIR}/data/pgdata，请检查数据是否被清空。"

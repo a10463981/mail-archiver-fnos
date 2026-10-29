@@ -77,6 +77,11 @@ migrate_data_root() {
     if [ -e "${data_root}" ] || [ -L "${data_root}" ]; then
         ts="$(date +%Y%m%d-%H%M%S)"
         bak="${data_root}.bak-${ts}"
+        _seq=0
+        while [ -e "${bak}" ] || [ -L "${bak}" ]; do
+            _seq=$((_seq + 1))
+            bak="${data_root}.bak-${ts}-${_seq}"
+        done
         if ! mv "${data_root}" "${bak}" 2>/dev/null; then
             log_migrate "could not move ${data_root} aside; aborting without touching any data"
             return 1

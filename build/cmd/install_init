@@ -14,48 +14,87 @@ warn() { echo "[${APP_NAME}] WARN: $*" >>"${LOG_FILE}" 2>/dev/null || true; echo
 say "install_init begin"
 
 # ---------------------------------------------------------------- 残留自愈（"存在安装历史"）
-# 平台在安装前会检查本应用的残留（半成品目录/临时目录）。若命中，界面上只显示
-# "存在安装历史"，用户不知道删什么，只能手工猜。这里**只针对本应用**做两件事：
-#   1) 能安全清的就清（平台临时目录 ${TRIM_APPTEMP}/<app> 里的内容）；
-#   2) 不能安全清的（数据/配置/运行目录）**不删**，但把确切路径打出来，让用户知道删什么。
-# 白名单：只允许在 ${TRIM_APPTEMP} 之下操作；其它路径一律只打印不删除。
-clean_app_residue() {
-    local app="$1" tmp="${TRIM_APPTEMP:-}" cleaned=0 blocked=""
+# ★ 判定语义（用户实测指出并确认）：**空目录 = 干净**，只有"目录里有内容"才算残留。
+#   平台卸载后常留下**空壳目录**（如 ${TRIM_APPTEMP}/<app>、/var/apps/<app>），
+#   旧实现用 `[ -d ]` 判存在 → 把空壳当残留，界面就报"未删干净"，用户只能手删。
+#   新实现一律用"内容是否为空"判断（`ls -A` / `find -mindepth 1 -print -quit`）。
+dir_has_content() {   # 0 = 有内容；1 = 空目录或不存在；符号链接单独算"有内容"
+    local p="$1"
+    [ -L "${p}" ] && return 0            # 链接本身即残留（目标不看）
+    [ -d "${p}" ] || return 1            # 不存在或非目录 → 不算残留
+    [ -n "$(ls -A "${p}" 2>/dev/null)" ] || return 1   # 空目录 → 干净
+    return 0
+}
 
+clean_app_residue() {
+    local app="$1" cleaned=0 blocked="" emptied=""
+    local tmp="${TRIM_APPTEMP:-}" ac="${TRIM_APPCENTER:-}"
+
+    # ① 平台临时目录：有内容才清；空壳只记录"已视为干净"
     if [ -n "${tmp}" ] && [ -d "${tmp}/${app}" ]; then
-        if [ -n "$(ls -A "${tmp}/${app}" 2>/dev/null)" ]; then
+        if dir_has_content "${tmp}/${app}"; then
             say "检测到平台临时目录残留：${tmp}/${app}（内容 $(ls -A "${tmp}/${app}" 2>/dev/null | tr '\n' ' ')），正在清理…"
             if find "${tmp}/${app}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null; then
-                say "已清理 ${tmp}/${app} 下的残留内容（目录本身保留，交给平台）"
+                say "已清理 ${tmp}/${app} 下的内容（目录本身保留）"
                 cleaned=1
             else
                 blocked="${blocked}\n  ${tmp}/${app}（清理失败，需要 root 删除）"
             fi
+        else
+            say "平台临时目录为空壳（无任何文件），**视为干净**：${tmp}/${app}"
+            emptied="${emptied}\n  ${tmp}/${app}"
         fi
     fi
 
-    # 以下目录**不删**（属数据/配置/运行产物），只在存在时给出可执行指引
-    local d
-    for d in "${TRIM_PKGVAR:-}/data" "${TRIM_PKGETC:-}" "${TRIM_APPDEST:-}"; do
-        [ -n "${d}" ] || continue
-        case "${d}" in
-            "${TRIM_PKGVAR:-}/data")
-                # 空目录不算残留；有 pgdata/mail 才算"有数据"，那是用户的，不能删
-                if [ -e "${d}/pgdata" ] || [ -e "${d}/mail" ]; then
-                    say "提示：${d} 下已有数据（pgdata/mail），**不会被删除**；安装将沿用这份数据。"
-                fi
-                ;;
-        esac
-    done
-
-    if [ -n "${blocked}" ]; then
-        fail "存在无法自动清理的本应用残留，请手工删除后重试：${blocked}
-
-（这些目录不属于任何其它应用或系统路径，删除是安全的；本脚本不会替你删数据。）"
+    # ② 陈旧运行时目录 @appcenter/<app>：同样按内容判断；有运行中容器则跳过
+    if [ -n "${ac}" ] && [ -d "${ac}/${app}" ]; then
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -qE "^${app}(-db)?$"; then
+            say "提示：${ac}/${app} 有内容但本应用容器仍在运行，跳过清理（请先在应用中心停止应用）。"
+        elif dir_has_content "${ac}/${app}"; then
+            say "检测到陈旧运行时残留：${ac}/${app}（无运行中容器），正在清理…"
+            if find "${ac}/${app}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null; then
+                say "已清理 ${ac}/${app} 下的内容（目录本身保留，平台会重建）"
+                cleaned=1
+            else
+                blocked="${blocked}\n  ${ac}/${app}（清理失败，需要 root）"
+            fi
+        else
+            say "运行时目录为空壳（无任何文件），**视为干净**：${ac}/${app}"
+            emptied="${emptied}\n  ${ac}/${app}"
+        fi
     fi
 
-    [ "${cleaned}" = "1" ] && say "残留自愈完成：已清理本应用在平台临时目录下的残留。" \
-        || say "残留自愈检查完成：未发现需要清理的本应用临时残留。"
+    # ③ 数据根：pgdata **非空** 才算"已有数据"（空 pgdata = 全新安装）
+    local pg="${TRIM_PKGVAR:-}/data/pgdata"
+    if [ -d "${pg}" ] && [ -n "$(ls -A "${pg}" 2>/dev/null)" ]; then
+        say "提示：${pg} 已有数据（非空），**不会被删除**；安装将沿用这份数据。"
+    fi
+
+    # ④ 其它本应用路径：**按内容**报告，空壳一律视为干净
+    local d extra=""
+    for d in "${TRIM_PKGETC:-}" "${TRIM_APPMETA:-}" "${TRIM_APPHOME:-}"; do
+        [ -n "${d}" ] || continue
+        [ -e "${d}" ] || continue
+        if dir_has_content "${d}"; then extra="${extra}\n  ${d}"; else emptied="${emptied}\n  ${d}"; fi
+    done
+    if [ -n "${extra}" ]; then
+        say "以下本应用路径**含有内容**（安装会复用它们；若平台仍报「存在安装历史」而无法继续，请删除这些路径后重试，或运行 scripts/clean-app-residue.sh）："
+        printf '%b\n' "${extra}" | sed '/^$/d;s/^/    /'
+    fi
+    if [ -n "${emptied}" ]; then
+        say "以下为空壳目录（无文件），**已视为干净、不会拦截安装**，安装时会被清空并复用："
+        printf '%b\n' "${emptied}" | sed '/^$/d;s/^/    /'
+    fi
+
+    if [ -n "${blocked}" ]; then
+        fail "存在无法自动清理的本应用残留（有内容且清理失败），请手工删除后重试：${blocked}"
+    fi
+
+    if [ "${cleaned}" = "1" ]; then
+        say "残留自愈完成：已清理本应用**有内容**的残留（空壳目录不拦人）。"
+    else
+        say "残留自愈检查完成：未发现需要清理的残留（空壳目录一律视为干净）。"
+    fi
 }
 
 clean_app_residue "${APP_NAME}"

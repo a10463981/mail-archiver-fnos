@@ -4,7 +4,7 @@
 # （recon/fnos-fpk-p1/docker-compose.fnos.yaml）以本文件为准对齐。
 #
 # 四条硬约束（改前必读）：
-#   1) 不 publish 任何 TCP 端口。应用只通过 ${TRIM_APPDEST}/app.sock 暴露给 fnOS 统一网关；
+#   1) 不 publish 任何 TCP 端口。应用只通过 /var/apps/<app>/target/app.sock(=@appcenter/<app>/app.sock) 暴露给网关；
 #      一旦发布端口，局域网任何进程都能伪造 X-Trim-Isadmin 冒充管理员（已实测）。
 #   2) 容器一律以 ${TRIM_UID}:${TRIM_GID} 运行（非 root）。凡 bind mount 进容器的宿主目录，
 #      属主必须是 TRIM_UID —— 否则 DataProtection 写不了 keyring → 每次重启换密钥 → 全员掉线
@@ -31,6 +31,7 @@ services:
       # ① unix socket 落点：容器内外同路径，使 LISTEN_UNIX_SOCKET 在两侧都成立
       #    属主=应用用户（载荷目录），权限由 UnixSocketPermissionService 收到 600
       - "${TRIM_APPDEST:?TRIM_APPDEST missing}:${TRIM_APPDEST:?TRIM_APPDEST missing}"
+      - "/vol1/@appcenter/mail-archiver-fnos:/vol1/@appcenter/mail-archiver-fnos"
 
       # ② 配置/日志/DataProtection-Keys 的父目录  →  容器 /data
       #    宿主权限 750，属主 TRIM_UID

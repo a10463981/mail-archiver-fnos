@@ -290,7 +290,8 @@ _last_action="$(head -n1 "${CFG_DIR}/last_uninstall_action" 2>/dev/null || true)
 # 判定**只基于应用标准数据根** ${VAR_DIR}/data；外部自定义目录不由应用管理，不参与判定、不会被删除。
 if command -v standard_root_has_db >/dev/null 2>&1 && standard_root_has_db "${DATA_ROOT}"; then
     _real="$(readlink -f "${DATA_ROOT}" 2>/dev/null || echo "${DATA_ROOT}")"
-    if [ "${_last_action}" = "delete" ] && [ -e "${DATA_ROOT}" ]; then
+    # 只有"标准数据根里确实还有数据库内容"才算删除没生效；空壳目录不算
+    if [ "${_last_action}" = "delete" ] && { [ -d "${DATA_ROOT}/pgdata" ] && [ -n "$(ls -A "${DATA_ROOT}/pgdata" 2>/dev/null)" ]; }; then
         fail "上一次卸载选择的是「删除数据」，但标准数据根 ${DATA_ROOT} 仍然存在（${_real}）——说明删除没有生效。
 已中止安装，避免沿用旧账号导致"新密码登不进"。
 请确认后重试（若 ${_real} 是你自建的外部目录，请把 ${DATA_ROOT} 这个链接删掉再装）。"
