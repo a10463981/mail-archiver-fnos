@@ -1,20 +1,16 @@
 # Mail-archiver for fnOS（mail-archiver-fnos）
 
-把 [Mail-archiver](https://github.com/s1t5/mail-archiver) 打包成 **飞牛 fnOS** 安装包（`.fpk`）。
+把 [Mail-archiver](https://github.com/s1t5/mail-archiver) 打包成 **飞牛 fnOS** 安装包。GPL-3.0，修改见 `patches/`。
 
-> ⚠️ 本仓库是上游的**修改分发版**，修改见 `patches/`，同样以 **GPL-3.0** 分发。
-
-## 最新版本：v0.1.21
-
+## 最新版本：v0.1.22
 见 [Releases](https://github.com/a10463981/mail-archiver-fnos/releases)（上游 `39f59d2`）。
 
-**0.1.21**：切数据目录前**无条件对齐数据库口令**（修复切到已有库时因口令不一致导致应用起不来）；每次启动自动补齐载荷 `docker/` 目录（`app.env`/`pg_password`/`compose`）。含 0.1.20 及之前全部修复。
+**0.1.22**：**运行期不再支持切换数据目录**（设置页该项只读）。换目录请：应用中心「卸载」→ 选**保留数据** → 重新安装时在向导里指定新目录。同时修复 `ensure_payload_docker_dir` 调用顺序（此前导致载荷 `docker/` 缺失、容器起不来）。
 
-## 前置条件
-fnOS ≥ 1.2.0401、x86_64、内存 ≥4GB。
+## 如何更换数据目录
+1. 应用中心 → 「邮件归档」→ 卸载 → 选 **保留数据**（个人目录不会被删除）
+2. 应用中心 → 手动安装 → 选 `.fpk` → 向导里**指定新的数据目录**
+3. 启动 → 用原账号密码登录
 
-## 安装/卸载/密码语义/安全
-见 `docs/` 与 `VERSION-MAP.md`。
-
-## 许可
-GPL-3.0（[LICENSE](LICENSE)）。上游 [s1t5/mail-archiver](https://github.com/s1t5/mail-archiver)（`39f59d2`）的修改分发版。
+## 前置条件 / 文档 / 许可
+fnOS ≥ 1.2.0401、x86_64、≥4GB。文档见 `docs/`；版本表 `VERSION-MAP.md`；GPL-3.0（[LICENSE](LICENSE)）。

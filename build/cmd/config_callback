@@ -19,122 +19,21 @@ trace() { { mkdir -p "${VAR_DIR}" && echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"$
 compose() { docker compose -p "${APP_NAME}" -f "${COMPOSE_FILE}" "$@"; }
 
 trace "config_callback begin"
-ensure_payload_docker_dir   # 0.1.21：起栈前保证载荷 docker 目录齐整
 [ -f "${APP_ENV}" ] || fail "缺少 ${APP_ENV}，请先重装应用（或运行一次 cmd/install_callback）。"
 
 # 1) 换数据目录：只改符号链接，不搬数据
 data_mode="${wizard_data_mode:-keep}"
 data_target="${wizard_data_dir:-}"
-if [ "${data_mode}" = "custom" ]; then
-    # R1：绝不 rm -rf。migrate_data_root 会先 compose down（不带 -v）、把旧根 mv 成 .bak-时间戳、
-    # 建新根并写探针验证；任一步失败都会把旧根移回原位并返回非 0，调用方据此中止。
-    . "$(dirname "$0")/lib/data-root-migration.sh" 2>/dev/null \
-        || . "${APPDEST}/cmd/lib/data-root-migration.sh" 2>/dev/null \
-        || fail "缺少 data-root-migration.sh（fpk 打包不完整）"
-    _mig_bak="$(ls -d "${DATA_ROOT}".bak-* 2>/dev/null | tail -1 || true)"
-    if ! migrate_data_root "${DATA_ROOT}" "${data_target}" "${APP_NAME}" "${COMPOSE_FILE}"; then
-        # P0：失败也必须**保可用** —— 旧实现回滚后直接 fail，容器被 compose down 后没人拉起，
-        #      用户/平台再 start 会报 "service postgres has no container to start"。
-        say "数据目录切换失败：原有数据未被改动，已恢复原状。正在把应用重新拉起…"
-        compose up -d >/dev/null 2>&1 || docker compose -p "${APP_NAME}" -f "${COMPOSE_FILE}" up -d >/dev/null 2>&1 || true
-        for _i in 1 2 3 4 5 6; do
-            docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "${APP_NAME}" && break
-            sleep 4
-        done
-        fail "数据目录切换失败：原有数据未被改动，**应用已按原状重启**（若仍未启动请到应用中心点一次「启动」）。请检查目标目录是否可写后重试（目标：${data_target}）。"
-    fi
-    printf '%s\n' "${data_target}" >"${CFG_DIR}/data_target" 2>/dev/null || true
-    # 0.1.21（DB 口令对齐，切到旧库的关键修复）：切到**已有**数据目录时，那份库里的 mailarchiver 角色口令
-    # 很可能还是它初始化时的旧口令 ≠ 当前 @appconf/pg_password ⇒ 应用 28P01 起不来、socket 永不就绪，
-    # 而旧的自愈又要求"应用先起来"才会触发 → 死锁。改为**先起 db → 无条件 ALTER ROLE 对齐 → 再起 app**。
-    if [ -s "${CFG_DIR}/pg_password" ]; then
-        compose up -d --force-recreate postgres >/dev/null 2>&1 || true   # 先起 db（compose 服务名 postgres）
-        for _i in $(seq 1 12); do
-            docker exec "${APP_NAME}-db" pg_isready -U mailarchiver >/dev/null 2>&1 && break
-            sleep 5
-        done
-        _pw="$(cat "${CFG_DIR}/pg_password")"
-        if printf "ALTER ROLE mailarchiver WITH PASSWORD '%s';\n" "$(printf '%s' "${_pw}" | sed "s/'/''/g")" \
-             | docker exec -i "${APP_NAME}-db" psql -U mailarchiver -d postgres -tA >/dev/null 2>&1; then
-            say "数据库口令已对齐到当前配置（切到已有库时自动生效，无需手动改）。"
-            trace "config_callback: db password aligned on switch"
-        else
-            warn "对齐数据库口令失败；稍后 28P01 自愈会再尝试，或手工执行 ALTER ROLE。"
-        fi
-    fi
-    # MF-1：迁移内部会 `compose down`，必须**主动拉起来**，否则用户看到"应用停了"、点启动后进的是空库，
-    #       会再次被理解为"数据全丢"（本次事故的同型场景）。
-    # MF-1'（0.1.17）：**平台在配置动作里会先 STOP、再尝试 START**（实测 trim_app_center 事件：
-    #   APP_STOPPED → APP_START_FAILED_DOCKER_COMPOSE_EXCEPTION → APP_CRASH）。
-    #   我们若立刻 compose up，会与平台状态机抢，反而把平台的 START 撞成 compose 异常。
-    #   因此改为**有界看护**：最多 8 轮 × 4s，只在"容器确实没在跑"时才补一次 up，
-    #   并逐轮记录，最后给出明确结果（成功 / 需要你点启动 + 原因）。
-    # 0.1.18：全新目录 initdb 需 45–60s，看护放宽到 18×5s=90s；且"就绪"要同时看容器与 socket。
-    _ensure_ok=0; _try=0
-    _sock="${APPDEST}/target/app.sock"          # 网关经由 /var/apps/<app>/target(=@appcenter/<app>)/app.sock
-    if docker compose version >/dev/null 2>&1; then
-        while [ "${_try}" -lt 18 ]; do
-            _try=$((_try + 1))
-            if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "${APP_NAME}" \
-               && [ -S "${_sock}" ]; then
-                _ensure_ok=1; break
-            fi
-            say "看护第 ${_try} 轮：容器/socket 未就绪，补一次启动…"
-            compose up -d --force-recreate >/dev/null 2>&1 || true
-            sleep 5
-        done
-    fi
-    # ★ DB 口令对齐自愈（实测根因：新 pgdata 用**空口令**初始化 ⇒ 应用 28P01 ⇒ 打开空白页）
-    if [ "${_ensure_ok}" = "1" ] && docker logs --since 90s "${APP_NAME}" 2>&1 | grep -q "28P01"; then
-        say "检测到应用连不上数据库（28P01 口令不匹配），正在对齐数据库口令…"
-        _pw="$(cat "${CFG_DIR}/pg_password" 2>/dev/null || true)"
-        if [ -n "${_pw}" ]; then
-            if printf 'ALTER ROLE %s WITH PASSWORD %s;\n' "${PG_USER:-mailarchiver}" "$(printf '%s' "${_pw}" | sed "s/'/''/g; s/^/'/; s/$/'/")" \
-                 | docker exec -i "${APP_NAME}-db" psql -U "${PG_USER:-mailarchiver}" -d postgres -tA >/dev/null 2>&1; then
-                say "数据库口令已对齐，重启应用使其重连…"
-                docker restart "${APP_NAME}" >/dev/null 2>&1 || true
-                sleep 8
-            else
-                warn "对齐数据库口令失败；请执行：docker exec -i ${APP_NAME}-db psql -U ${PG_USER:-mailarchiver} -d postgres -c \"ALTER ROLE ${PG_USER:-mailarchiver} WITH PASSWORD '…';\""
-            fi
-        fi
-    fi
-
-    # ★ 真正"可服务"探测：不只看端口/容器，还要能取到非空页面
-    # 实测：切到全新目录后，第一次要跑 EF 迁移 + 绑账号，约需 40–60s 才可服务，
-    # 所以探测窗口放宽到 12×5s=60s（此前 6×4s=24s 会误报"页面仍未就绪"）。
-    _http_ok=0
-    for _i in 1 2 3 4 5 6 7 8 9 10 11 12; do
-        _b="$(curl -s -o /dev/null -m 8 -w '%{size_download}' --unix-socket "${_sock}" \
-              -H 'Host: h' -H "X-Trim-Userid: ${TRIM_UID:-1000}" http://h/app/mail-archiver-fnos/ 2>/dev/null || echo 0)"
-        [ "${_b:-0}" -gt 200 ] && { _http_ok=1; break; }
-        sleep 5
-    done
-
-    if [ "${_ensure_ok}" = "1" ] && [ "${_http_ok}" = "1" ]; then
-        say "数据目录已切换，应用已按新目录重新运行（页面可访问）。"
-    elif [ "${_ensure_ok}" = "1" ] && [ -S "${_sock}" ]; then
-        _recent="$(docker logs --tail 5 "${APP_NAME}" 2>&1 | tr '\n' ' ' | cut -c1-240)"
-        say "数据目录已切换，容器在运行，但页面仍未就绪；可能是首次初始化较慢。"
-        say "  容器最近日志：${_recent:-（无）}"
-    elif [ "${_ensure_ok}" = "1" ]; then
-        say "数据目录已切换，容器已运行，但 socket 尚未出现；请稍等或到应用中心点一次「启动」。"
-    else
-        _why="$(docker logs --tail 3 "${APP_NAME}" 2>&1 | tr '\n' ' ' | cut -c1-300)"
-        warn "数据目录已切换，但**应用仍未能自动启动**（已尝试 ${_try} 轮）。请到应用中心点一次「启动」。"
-        warn "容器最后 3 行日志：${_why:-（无日志，容器可能从未创建）}"
-        trace "config_callback: auto-start failed after ${_try} tries"
-    fi
-    say "⚠️ 新目录当前是**空库**（0 账号、0 邮件）：应用只会使用新目录里的数据。"
-    if [ -n "${_mig_bak}" ]; then
-        say "   原有数据完整保留在：${_mig_bak}（**没有删除**）。"
-        say "   如需沿用旧数据，请先把该目录内容迁到新目录，再点「重启」；或把它手工移回原位后重新切换。"
-    fi
-    printf '%s\n' "${data_target}" >"${CFG_DIR}/data_target" 2>/dev/null || true
-elif [ "${data_mode}" = "default" ]; then
-    if [ -L "${DATA_ROOT}" ]; then
-        rm -f "${DATA_ROOT}" && mkdir -p "${DATA_ROOT}/mail" "${DATA_ROOT}/pgdata"
-        say "数据目录已恢复为应用自有目录：${DATA_ROOT}"
+# ================= 0.1.22 方案 B：运行期不支持切换数据目录 =================
+# 为什么移除：一次运行期切换要同时满足"符号链接改向 + 容器强制重建 + 目标库口令对齐 + 载荷 docker 目录齐全"，
+# 且与平台状态机（保存配置时 STOP→自己 START）天然抢跑；历史上所有"起不来/白屏/转圈"都出在这条链路上。
+# 换目录的唯一入口改为：应用中心「卸载」→ 选「保留数据」→ 重装时在向导里指定新目录。
+if [ "${data_mode}" = "custom" ] || [ "${data_mode}" = "default" ]; then
+    say "数据目录运行期不可改（方案 B）：本次**未执行任何迁移**，应用保持原状。"
+    say "如需更换数据目录：应用中心「卸载」并选择「保留数据」→ 重新安装时在向导里指定新目录。"
+    trace "config_callback: data-dir switch refused (plan B, mode=${data_mode})"
+    if [ -n "${data_target}" ]; then
+        say "（你填写的目标：${data_target}；未做任何改动）"
     fi
 fi
 
@@ -200,6 +99,9 @@ else
 fi
 
 
+# 0.1.22：不再需要后台化 fast-path —— 方案 B 下运行期不切目录，保存本身<10s。
+
+ensure_payload_docker_dir   # 0.1.22：修——必须在本行之前 source 过 lib_runtime_dirs，否则 command not found
 ensure_runtime_dirs
 verify_runtime_dirs || fail "运行目录属主/权限校验失败"
 
