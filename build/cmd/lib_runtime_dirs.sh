@@ -206,3 +206,36 @@ ${_report}
     say "运行期目录可写性校验通过（8 项；属主不一致但可写的项已按可写判定放行）"
     return 0
 }
+
+# ---------------------------------------------------------------- 载荷 docker 目录加固（0.1.21）
+# ${TRIM_APPDEST}/docker/ 是平台按它起 compose 的地方，必须**始终**有这三样：
+#   docker-compose.yaml(644) / app.env(600) / pg_password(600,非空,属主应用用户)。
+# 之前只在 install 时写一次，切目录/失败回滚后可能缺失（已实测导致 compose 起不来）。
+ensure_payload_docker_dir() {
+    local app="${APP_NAME:-mail-archiver-fnos}"
+    local dst="${APPDEST:-${TRIM_APPDEST}}/docker"
+    local src="${APPCENTER:-/vol1/@appcenter/${app}}/docker"
+    local need="" f
+    mkdir -p "${dst}" 2>/dev/null || return 1
+    if [ ! -f "${dst}/docker-compose.yaml" ] && [ -f "${src}/docker-compose.yaml" ]; then
+        install -m 644 "${src}/docker-compose.yaml" "${dst}/docker-compose.yaml" 2>/dev/null && need="${need} docker-compose.yaml"
+    fi
+    if [ ! -s "${dst}/app.env" ] && [ -f "${src}/app.env" ]; then
+        install -m 600 "${src}/app.env" "${dst}/app.env" 2>/dev/null && need="${need} app.env"
+    fi
+    if [ ! -s "${dst}/pg_password" ]; then
+        if [ -s "${CFG_DIR:-${TRIM_PKGETC}}/pg_password" ]; then
+            install -m 600 "${CFG_DIR:-${TRIM_PKGETC}}/pg_password" "${dst}/pg_password" 2>/dev/null && need="${need} pg_password"
+        elif [ -s "${src}/pg_password" ]; then
+            install -m 600 "${src}/pg_password" "${dst}/pg_password" 2>/dev/null && need="${need} pg_password"
+        else
+            (umask 077; LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32 >"${dst}/pg_password") 2>/dev/null && need="${need} pg_password(新生成)"
+        fi
+    fi
+    for f in app.env pg_password; do
+        [ -f "${dst}/${f}" ] && { chown "${TRIM_UID:-987}:${TRIM_GID:-982}" "${dst}/${f}" 2>/dev/null || true; chmod 600 "${dst}/${f}" 2>/dev/null || true; }
+    done
+    [ -f "${dst}/docker-compose.yaml" ] && chmod 644 "${dst}/docker-compose.yaml" 2>/dev/null || true
+    if [ -n "${need}" ]; then say "已补齐载荷 docker 目录（${need# }）"; fi
+    return 0
+}

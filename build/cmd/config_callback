@@ -19,6 +19,7 @@ trace() { { mkdir -p "${VAR_DIR}" && echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"$
 compose() { docker compose -p "${APP_NAME}" -f "${COMPOSE_FILE}" "$@"; }
 
 trace "config_callback begin"
+ensure_payload_docker_dir   # 0.1.21：起栈前保证载荷 docker 目录齐整
 [ -f "${APP_ENV}" ] || fail "缺少 ${APP_ENV}，请先重装应用（或运行一次 cmd/install_callback）。"
 
 # 1) 换数据目录：只改符号链接，不搬数据
@@ -43,6 +44,24 @@ if [ "${data_mode}" = "custom" ]; then
         fail "数据目录切换失败：原有数据未被改动，**应用已按原状重启**（若仍未启动请到应用中心点一次「启动」）。请检查目标目录是否可写后重试（目标：${data_target}）。"
     fi
     printf '%s\n' "${data_target}" >"${CFG_DIR}/data_target" 2>/dev/null || true
+    # 0.1.21（DB 口令对齐，切到旧库的关键修复）：切到**已有**数据目录时，那份库里的 mailarchiver 角色口令
+    # 很可能还是它初始化时的旧口令 ≠ 当前 @appconf/pg_password ⇒ 应用 28P01 起不来、socket 永不就绪，
+    # 而旧的自愈又要求"应用先起来"才会触发 → 死锁。改为**先起 db → 无条件 ALTER ROLE 对齐 → 再起 app**。
+    if [ -s "${CFG_DIR}/pg_password" ]; then
+        compose up -d --force-recreate postgres >/dev/null 2>&1 || true   # 先起 db（compose 服务名 postgres）
+        for _i in $(seq 1 12); do
+            docker exec "${APP_NAME}-db" pg_isready -U mailarchiver >/dev/null 2>&1 && break
+            sleep 5
+        done
+        _pw="$(cat "${CFG_DIR}/pg_password")"
+        if printf "ALTER ROLE mailarchiver WITH PASSWORD '%s';\n" "$(printf '%s' "${_pw}" | sed "s/'/''/g")" \
+             | docker exec -i "${APP_NAME}-db" psql -U mailarchiver -d postgres -tA >/dev/null 2>&1; then
+            say "数据库口令已对齐到当前配置（切到已有库时自动生效，无需手动改）。"
+            trace "config_callback: db password aligned on switch"
+        else
+            warn "对齐数据库口令失败；稍后 28P01 自愈会再尝试，或手工执行 ALTER ROLE。"
+        fi
+    fi
     # MF-1：迁移内部会 `compose down`，必须**主动拉起来**，否则用户看到"应用停了"、点启动后进的是空库，
     #       会再次被理解为"数据全丢"（本次事故的同型场景）。
     # MF-1'（0.1.17）：**平台在配置动作里会先 STOP、再尝试 START**（实测 trim_app_center 事件：

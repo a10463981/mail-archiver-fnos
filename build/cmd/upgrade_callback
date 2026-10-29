@@ -1,3 +1,4 @@
+ensure_payload_docker_dir
 #!/bin/bash
 # 升级后：确认单容器真起来了、socket 在、数据目录还在
 set -u

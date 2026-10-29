@@ -372,5 +372,6 @@ if [ -n "${ADMIN_PASS}" ] && [ "${_env_pw}" != "${ADMIN_PASS}" ]; then
 fi
 say "app.env 自检通过：Authentication__Password 长度=${_env_pw_len}（为空表示沿用库中哈希）"
 
+ensure_payload_docker_dir
 trace "install_callback ok"
 exit 0

@@ -17,6 +17,8 @@ warn() { echo "[${APP_NAME}] WARN: $*" >>"${LOG_FILE}" 2>/dev/null || true; echo
 trace() { { mkdir -p "${VAR_DIR}" && echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"${VAR_DIR}/lifecycle.log"; } 2>/dev/null || true; }
 
 # socket 权限看护：容器自己会 chmod，这里再兜一层（真实应用换成 Kestrel 时尤其需要）
+. "$(dirname "$0")/lib_runtime_dirs.sh" 2>/dev/null
+
 watch_socket() {
     (
         i=0
@@ -38,6 +40,7 @@ watch_socket() {
 case "${1:-}" in
     start)
         trace "main start"
+        ensure_payload_docker_dir
         [ -f "${COMPOSE_FILE}" ] || fail "compose 文件缺失：${COMPOSE_FILE}"
         # 容器由应用中心托管启动；这里做一次幂等 up 保证读到当前 app.env（冷启动占位配置不会被沿用）
         if docker compose version >/dev/null 2>&1; then
