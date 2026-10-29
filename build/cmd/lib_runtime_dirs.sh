@@ -223,14 +223,16 @@ ensure_payload_docker_dir() {
     if [ ! -s "${dst}/app.env" ] && [ -f "${src}/app.env" ]; then
         install -m 600 "${src}/app.env" "${dst}/app.env" 2>/dev/null && need="${need} app.env"
     fi
-    if [ ! -s "${dst}/pg_password" ]; then
-        if [ -s "${CFG_DIR:-${TRIM_PKGETC}}/pg_password" ]; then
-            install -m 600 "${CFG_DIR:-${TRIM_PKGETC}}/pg_password" "${dst}/pg_password" 2>/dev/null && need="${need} pg_password"
-        elif [ -s "${src}/pg_password" ]; then
-            install -m 600 "${src}/pg_password" "${dst}/pg_password" 2>/dev/null && need="${need} pg_password"
+    # 0.1.32（禁模板源）：口令**只认 ${CFG_DIR}/pg_password**；不再从 @appcenter 模板兜底
+    # （模板曾是 change_me 占位符，是"9 字节 vs 32 字节"真因之一）。
+    if command -v ensure_payload_pg_password >/dev/null 2>&1; then
+        if ensure_payload_pg_password "${dst}/pg_password" "${CFG_DIR:-${TRIM_PKGETC}}/pg_password" >/dev/null 2>&1; then
+            need="${need} pg_password"
         else
-            (umask 077; LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32 >"${dst}/pg_password") 2>/dev/null && need="${need} pg_password(新生成)"
+            warn "ensure_payload: 权威口令缺失或不合规，且已禁止用模板兜底"
         fi
+    else
+        warn "ensure_payload: 缺少 pg-password-guard.sh，跳过口令补齐"
     fi
     # 0.1.23：纠正 app.env 的 socket 落点（必须 @appcenter；旧版写 APPDEST 会绑定失败）
     _want="${APPCENTER:-/vol1/@appcenter/${app}}/app.sock"   # 0.1.26：实测绑 target 符号链接会 EADDRNOTAVAIL(99)，改绑其指向的真实路径（同一 inode）

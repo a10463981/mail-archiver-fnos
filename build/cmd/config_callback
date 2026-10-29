@@ -2,14 +2,17 @@
 # 设置页保存后：改密码 / 换数据目录 / 换时区，然后重建容器让新环境生效。
 set -u
 
-APP_NAME=mail-archiver-fnos
+APP_NAME="${APP_NAME:-mail-archiver-fnos}"
 CFG_DIR="${TRIM_PKGETC}"
 VAR_DIR="${TRIM_PKGVAR}"
-APPDEST="${TRIM_APPDEST}"
+APPDEST="${TRIM_APPDEST:-}"   # set -u 下未定义会直接崩，兜底必须先取到空串
 LOG_FILE="${TRIM_TEMP_LOGFILE:-${TRIM_PKGVAR:-/tmp}/lifecycle.log}"
 APP_ENV="${CFG_DIR}/app.env"
 SETTINGS="${CFG_DIR}/settings.env"
-COMPOSE_FILE="${APPDEST}/docker/docker-compose.yaml"
+# 0.1.44：APPDEST 为空时曾拼成 /docker/docker-compose.yaml → "exit status 1: open /docker/…"（装不上）。
+# 这里只加缺省兜底，非空时行为完全不变。
+APPDEST="${APPDEST:-/vol1/@appcenter/${APP_NAME}}"
+COMPOSE_FILE="${APPDEST:-/vol1/@appcenter/${APP_NAME}}/docker/docker-compose.yaml"
 DATA_ROOT="${VAR_DIR}/data"
 
 say() { echo "[${APP_NAME}] $*"; }
@@ -20,6 +23,14 @@ compose() { docker compose -p "${APP_NAME}" -f "${COMPOSE_FILE}" "$@"; }
 
 trace "config_callback begin"
 [ -f "${APP_ENV}" ] || fail "缺少 ${APP_ENV}，请先重装应用（或运行一次 cmd/install_callback）。"
+
+# 0.1.37：运行设置动作分派组件（校验→备份→执行→回滚；明文只进环境变量）
+for _l in runtime-settings.sh pg-password-guard.sh; do
+    [ -r "$(dirname "$0")/lib/${_l}" ] && . "$(dirname "$0")/lib/${_l}" 2>/dev/null || true
+done
+
+# 0.1.38：数据目录改为 tips 说明（非输入框），无需注入字段；路径只在日志里打印一次
+say "当前数据目录（只读）：$(readlink -f "${DATA_ROOT}" 2>/dev/null || echo "${DATA_ROOT}")"
 
 # 1) 换数据目录：只改符号链接，不搬数据
 data_mode="${wizard_data_mode:-keep}"
@@ -37,48 +48,28 @@ if [ "${data_mode}" = "custom" ] || [ "${data_mode}" = "default" ]; then
     fi
 fi
 
-# 2) 重置管理员密码（留空=不改）
-# 关键（P0 修复）：不再只写 app.env —— Authentication__Password 只对"首次建号"生效，
-# 对已存在账号无效（用户报过"设置页改密码＝白改"）。现在**直接调用包内 CLI 改库**：
-# 立即生效、无需重启；密码只经环境变量传入，不进命令行参数（避免 ps / shell 历史泄漏）。
-np="${wizard_admin_password:-}"
-if [ -n "${np}" ]; then
-    _target_user="$(grep -m1 '^Authentication__Username=' "${APP_ENV}" 2>/dev/null | cut -d= -f2-)"
-    [ -n "${_target_user}" ] || _target_user="admin"
-    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${APP_NAME}$"; then
-        fail "应用容器（${APP_NAME}）未在运行，无法改库。请先到应用中心启动应用，再回到设置页重试。"
-    fi
-    # MF-4：**只调用一次**（旧实现调用两次 ⇒ 双写库 + 双条审计，排障时容易误判）
-    _reset_rc=0
-    _reset_out="$(MFA_RESET_PASSWORD="${np}" docker exec -e MFA_RESET_PASSWORD \
-        "${APP_NAME}" dotnet MailArchiver.dll --reset-password "${_target_user}" 2>&1)" || _reset_rc=$?
-    _reset_out="$(printf '%s' "${_reset_out}" | grep -viE '^warn|^info|^ +at |^ +---|^      ' | head -3 | tr '\n' ' ')"
-    if [ "${_reset_rc}" = "0" ]; then
-        say "管理员登录密码已重置（账号 ${_target_user}），**立即生效**，无需重启。"
-        say "注：密码只以哈希保存，无法查看，只能重置。"
-        trace "config_callback: password reset via CLI ok (${_target_user})"
+# 2) 【0.1.39 已删除旧路径】原「向导密码」段会"每次保存设置都把 admin 密码重置回
+#     安装时向导的口令"（实测 20 次覆盖、用户设置的新密码从未生效）。重置入口统一走下方 2b 的新分派。
+
+# 2b) 0.1.39：新版动作分派（两个动作**各自校验/执行/报告，互不阻塞**；有改动才重启一次）
+_dbpw="${cfg_db_password:-}"
+_admpw="${cfg_admin_reset_password:-}"
+if [ -n "${_dbpw}" ] || [ -n "${_admpw}" ]; then
+    if command -v runtime_settings_apply >/dev/null 2>&1; then
+        _adm_user="$(grep -m1 '^Authentication__Username=' "${APP_ENV}" 2>/dev/null | cut -d= -f2-)"
+        [ -n "${_adm_user}" ] || _adm_user="admin"
+        _rs_files="${CFG_DIR}/pg_password
+${CFG_DIR}/admin_password
+${APP_ENV}
+${APPDEST}/docker/pg_password"
+        # 0.1.43：第 4 位传**应用账号名**（_adm_user，来自 app.env Authentication__Username），
+        # 不再传数据库角色名 mailarchiver（那是 "no account named 'mailarchiver'" 的根因）；
+        # 数据库角色名由组件内部 DB_USER（默认 mailarchiver）负责。
+        runtime_settings_apply "${_dbpw}" "${_admpw}" \
+            "${APP_NAME}-db" "${_adm_user}" "mailarchiver" \
+            "${_rs_files}" "${CFG_DIR}" || true
     else
-        case "${_reset_out}" in
-            *"mail_archiver.Users"*"does not exist"*|*"42P01"*)
-                # 新建的空库：应用还没完成首次初始化（没有 Users 表），此时"改库"必然失败。
-                # 这不是错误 —— 继续走下去即可，首次启动时应用会用向导密码建号。
-                say "提示：当前数据库还是全新的（尚未创建账号表），无需重置密码；"
-                say "      应用首次启动后会按你向导里填的密码创建账号。"
-                trace "config_callback: skip password reset (fresh db, no Users table)"
-                ;;
-            *)
-                fail "重置管理员密码失败（账号 ${_target_user}）。CLI 输出：${_reset_out}
-请确认应用正在运行（应用中心 → 启动），或改用命令行：
-  docker exec -e MFA_RESET_PASSWORD='新密码' ${APP_NAME} dotnet MailArchiver.dll --reset-password ${_target_user}"
-                ;;
-        esac
-    fi
-    (umask 077; printf '%s\n' "${np}" >"${CFG_DIR}/admin_password") || warn "写入 ${CFG_DIR}/admin_password 失败（不影响登录）"
-    chmod 600 "${CFG_DIR}/admin_password" 2>/dev/null || true
-    if grep -q '^Authentication__Password=' "${APP_ENV}" 2>/dev/null; then
-        sed -i "s|^Authentication__Password=.*|Authentication__Password=${np}|" "${APP_ENV}" || fail "写入 ${APP_ENV} 失败"
-    else
-        printf 'Authentication__Password=%s\n' "${np}" >>"${APP_ENV}" || fail "写入 ${APP_ENV} 失败"
+        fail "缺少 cmd/lib/runtime-settings.sh（fpk 打包不完整）"
     fi
 fi
 
@@ -134,13 +125,16 @@ fi
 # ★ 必须**始终**把口令写进载荷：空文件会让 PostgreSQL 在初始化新 pgdata 时把角色口令设成空值，
 #   而应用用真口令连接 ⇒ `28P01 password authentication failed` ⇒ 每个请求都报错 ⇒ 打开应用**空白页**
 #   （实测：/ 会 302 到 /Auth/Login?returnUrl=/Home/Error 并循环，最终浏览器给出空白）
-if [ ! -s "${CFG_DIR}/pg_password" ]; then
-    ( umask 077; LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32 >"${CFG_DIR}/pg_password" ) 2>/dev/null ||         ( umask 077; printf '%s' "$(date +%s%N)$$" | sha256sum | cut -c1-32 >"${CFG_DIR}/pg_password" )
-    chmod 600 "${CFG_DIR}/pg_password" 2>/dev/null || true
+# 0.1.31：写入口令走 guard
+for _l in pg-password-guard.sh; do [ -r "$(dirname "$0")/lib/${_l}" ] && . "$(dirname "$0")/lib/${_l}" 2>/dev/null || true; done
+# 0.1.32：判据改为「缺失或不合规才生成」（不再只看非空）
+if ! pg_password_is_valid "$(head -n1 "${CFG_DIR}/pg_password" 2>/dev/null | tr -d '\r\n')" 2>/dev/null; then
+    _np="$(command -v generate_pg_password >/dev/null 2>&1 && generate_pg_password || (LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32))"
+    write_pg_password_guarded "${CFG_DIR}/pg_password" "${_np}" || warn "口令写入被 guard 拒绝（继续，稍后重试）"
     say "检测到 PostgreSQL 口令缺失，已重新生成（600）。"
 fi
-install -m 600 "${CFG_DIR}/pg_password" "${APPDEST}/docker/pg_password" 2>/dev/null \
-    || warn "渲染 ${APPDEST}/docker/pg_password 失败，新库初始化可能使用空口令。"
+backfill_pg_password "${APPDEST}/docker/pg_password" "${CFG_DIR}/pg_password" >/dev/null 2>&1 \
+    || warn "载荷口令回填失败（权威口令不合规）；新库初始化可能使用空口令。"
 # P0：容器以 ${TRIM_UID}:${TRIM_GID} 运行，读 secret/env_file —— 载荷里这些文件必须是**该用户**可读，
 #      否则 DB 起不来（/run/secrets/pg_password: Permission denied）。
 for _f in app.env pg_password docker-compose.yaml; do

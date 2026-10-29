@@ -1,74 +1,41 @@
 [
   {
-    "stepTitle": "数据目录（只读 · 运行期不支持切换）",
+    "stepTitle": "运行设置",
     "items": [
       {
         "type": "tips",
-        "helpText": "当前数据目录为只读展示。**运行期不支持切换数据目录**（避免服务中断与数据风险）。\n如需更换数据目录：请到应用中心「卸载」并选择**保留数据**，再重新安装时在向导里指定新目录。"
-      },
-      {
-        "type": "tips",
-        "helpText": "【先授权，再切换】要改数据目录，请先到「应用设置 → 访问权限」把目标目录授权给本应用，再回这里填写同一个路径；否则会报「数据目录不可写」。\n【保存后需重启】本页保存后配置不会立即生效，需到应用中心点一次「停止 → 启动」；这样做是为了不打断正在使用应用的人。"
-      },
-      {
-        "type": "select",
-        "field": "wizard_data_mode",
-        "label": "数据目录（只读）",
-        "initValue": "keep",
-        "options": [
-          {
-            "label": "不修改（运行期不支持切换）",
-            "value": "keep"
-          }
-        ]
+        "helpText": "当前数据目录：由系统分配或上次安装选择（只读）。\n更换：卸载（**保留数据**）后重装，在安装向导里指定新目录；可填任意已授权路径，例如 `/vol2/1000/mail-archive`。"
       },
       {
         "type": "text",
-        "field": "wizard_data_dir",
-        "label": "（已停用）如需更换目录请卸载(保留数据)后重装时选择",
+        "field": "cfg_timezone",
+        "label": "显示时区（IANA）",
         "initValue": "",
-        "rules": [
-          {
-            "pattern": "^$",
-            "message": "运行期不支持切换数据目录。请卸载（选择保留数据）后在安装向导里指定新目录。"
-          }
-        ]
-      }
-    ]
-  },
-  {
-    "stepTitle": "管理员密码",
-    "items": [
-      {
-        "type": "tips",
-        "helpText": "留空 = 不修改。改密码会重建容器，已登录的浏览器会话需要重新登录一次。"
+        "helpText": "保持现有即可，例如 Asia/Shanghai。"
       },
       {
         "type": "password",
-        "field": "wizard_admin_password",
-        "label": "新的管理员密码（留空 = 不修改）",
+        "field": "cfg_db_password",
+        "label": "数据库口令（应用内部用，一般不用改）",
         "initValue": "",
+        "helpText": "与登录密码无关；留空=不修改，填写=至少 16 位。保存后将重启应用约 10 秒。",
+        "rules": [
+          {
+            "pattern": "^$|^.{16,128}$",
+            "message": "留空，或至少 16 个字符"
+          }
+        ]
+      },
+      {
+        "type": "password",
+        "field": "cfg_admin_reset_password",
+        "label": "管理员登录密码（网页登录用）",
+        "initValue": "",
+        "helpText": "**忘记密码/登录不上时，在这里填新密码并保存即可立即生效**（应用内账号）。密码只存哈希、无法查看，只能重置。",
         "rules": [
           {
             "pattern": "^$|^.{8,128}$",
-            "message": "至少 8 个字符；留空表示不修改"
-          }
-        ]
-      }
-    ]
-  },
-  {
-    "stepTitle": "时区",
-    "items": [
-      {
-        "type": "text",
-        "field": "wizard_timezone",
-        "label": "显示时区（留空 = 不修改）",
-        "initValue": "",
-        "rules": [
-          {
-            "pattern": "^$|^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+)*$",
-            "message": "例如 Asia/Shanghai 或 UTC"
+            "message": "留空，或至少 8 个字符"
           }
         ]
       }

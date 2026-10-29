@@ -1,4 +1,3 @@
-ensure_payload_docker_dir
 #!/bin/bash
 # 升级后：确认单容器真起来了、socket 在、数据目录还在
 set -u
@@ -19,11 +18,13 @@ if [ -s "${CFG_DIR}/app.env" ]; then
     install -m 600 "${CFG_DIR}/app.env" "${APPDEST}/docker/app.env" 2>/dev/null \
         && say "已恢复 app.env 到载荷" || warn "恢复 app.env 失败"
 fi
+for _l in pg-password-guard.sh; do [ -r "$(dirname "$0")/lib/${_l}" ] && . "$(dirname "$0")/lib/${_l}" 2>/dev/null || true; done
 if [ -s "${CFG_DIR}/pg_password" ]; then
-    install -m 600 "${CFG_DIR}/pg_password" "${APPDEST}/docker/pg_password" 2>/dev/null || true
+    backfill_pg_password "${APPDEST}/docker/pg_password" "${CFG_DIR}/pg_password" >/dev/null 2>&1 || warn "upgrade: 口令副本回填失败（权威口令不合规）"
 fi
 
 # ---------------------------------------------------------------- 运行期目录（权威：cmd/lib_runtime_dirs.sh）
+ensure_payload_docker_dir   # 0.1.22：source 之后才可用
 LIB_DIRS="$(dirname "$0")/lib_runtime_dirs.sh"
 if [ -r "${LIB_DIRS}" ]; then
     . "${LIB_DIRS}"

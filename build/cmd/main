@@ -3,12 +3,15 @@
 # status 退出码：0=运行中就绪 / 1=在跑但未就绪（socket 缺失或权限不对） / 3=未运行
 set -u
 
-APP_NAME=mail-archiver-fnos
-APPDEST="${TRIM_APPDEST}"
+APP_NAME="${APP_NAME:-mail-archiver-fnos}"
+APPDEST="${TRIM_APPDEST:-}"   # set -u 下未定义会直接崩，兜底必须先取到空串
 VAR_DIR="${TRIM_PKGVAR}"
 CFG_DIR="${TRIM_PKGETC}"
 LOG_FILE="${TRIM_TEMP_LOGFILE:-${TRIM_PKGVAR:-/tmp}/lifecycle.log}"
-COMPOSE_FILE="${APPDEST}/docker/docker-compose.yaml"
+# 0.1.44：APPDEST 为空时曾拼成 /docker/docker-compose.yaml → "exit status 1: open /docker/…"（装不上）。
+# 这里只加缺省兜底，非空时行为完全不变。
+APPDEST="${APPDEST:-/vol1/@appcenter/${APP_NAME}}"
+COMPOSE_FILE="${APPDEST:-/vol1/@appcenter/${APP_NAME}}/docker/docker-compose.yaml"
 SOCK="${APPDEST}/app.sock"
 
 say() { echo "[${APP_NAME}] $*"; }
@@ -36,6 +39,38 @@ watch_socket() {
     ) >/dev/null 2>&1 &
     disown 2>/dev/null || true
 }
+
+# 0.1.36：查看数据库口令明文（读 600 文件；无文件则提示）
+if [ "${1:-}" = "--show-db-password" ]; then
+    # 0.1.38：直接读 @appconf/pg_password（600，天然受控），不再依赖 /vol1/1000 明文文件
+    _pf="${TRIM_PKGETC:-/vol1/@appconf/mail-archiver-fnos}/pg_password"
+    if command -v show_db_password >/dev/null 2>&1; then
+        show_db_password "${_pf}" && exit 0 || { echo "[${APP_NAME}] 口令不合规或缺失（${_pf}）" >&2; exit 1; }
+    else
+        echo "[${APP_NAME}] 缺少 cmd/lib/pg-password-guard.sh" >&2; exit 1
+    fi
+fi
+
+# 0.1.34：受控查看数据库口令指纹（只 len/sha8，绝不回显明文）
+if [ "${1:-}" = "--show-db-fingerprint" ]; then
+    for _l in pg-password-guard.sh; do
+        [ -r "$(dirname "$0")/lib/${_l}" ] && . "$(dirname "$0")/lib/${_l}" 2>/dev/null || true
+    done
+    _pwf="${TRIM_PKGETC:-/vol1/@appconf/mail-archiver-fnos}/pg_password"
+    if ! command -v show_db_fingerprint >/dev/null 2>&1; then
+        echo "[${APP_NAME}] 缺少 cmd/lib/pg-password-guard.sh" >&2; exit 1
+    fi
+    if show_db_fingerprint "${_pwf}"; then
+        echo "[${APP_NAME}] 数据库口令指纹如上（只显示指纹与长度，不回显明文）"
+        exit 0
+    else
+        echo "[${APP_NAME}] 指纹无意义：口令不合规/缺失（${_pwf}）" >&2
+        exit 1
+    fi
+fi
+
+# 0.1.35（M3）：socket 假告警降级
+for _l in mustfix-0134.sh; do [ -r "$(dirname "$0")/lib/${_l}" ] && . "$(dirname "$0")/lib/${_l}" 2>/dev/null || true; done
 
 case "${1:-}" in
     start)
@@ -66,8 +101,9 @@ fi
         running="$(docker inspect -f '{{.State.Running}}' "${APP_NAME}" 2>/dev/null)" || exit 3
         [ "${running}" = "true" ] || exit 3
         if [ ! -S "${SOCK}" ]; then
-            echo "[${APP_NAME}] status: 容器在跑但 ${SOCK} 不存在" >&2
-            exit 1
+            # 0.1.35（M3）：轮询 30s，未就绪也只 note，不以失败口吻收尾
+            wait_for_app_socket "${SOCK}" 30
+            [ -S "${SOCK}" ] || exit 1
         fi
         mode="$(stat -c '%a' "${SOCK}" 2>/dev/null || echo '')"
         if [ "${mode}" != "600" ]; then

@@ -39,58 +39,35 @@ SOCK_PATH="${APP_CENTER_DIR}/app.sock"
 # 0.1.23：数据目录校验必须在**本文件内**可用 can_write_as_app（它定义在 cmd/lib_runtime_dirs.sh）。
 # 旧实现用 `[ -w ]`：以 root 运行时“什么都可写”⇒ 未授权目录被误判为可写 → 迁移到一个应用写不进的目录
 # → 应用起不来（已实测复现）。此处提前 source，并改用它做“降权到运行用户”的真实可写探测。
+# 0.1.29：落地代码位组件（cmd/lib/password-consistency.sh、can-write-as-app.sh）
+# 0.1.35：mustfix-0134 置于 data-dir-decision 之后、lib_runtime_dirs 之前（can_write_as_app 仍以 lib_runtime_dirs 强版为准）
+for _l in password-consistency.sh can-write-as-app.sh data-dir-decision.sh mustfix-0134.sh data-root-defense.sh pg-password-guard.sh; do
+    [ -r "$(dirname "$0")/lib/${_l}" ] && . "$(dirname "$0")/lib/${_l}" 2>/dev/null || true
+done
+
 if [ -r "$(dirname "$0")/lib_runtime_dirs.sh" ]; then . "$(dirname "$0")/lib_runtime_dirs.sh"
 elif [ -r "${APPDEST}/cmd/lib_runtime_dirs.sh" ]; then . "${APPDEST}/cmd/lib_runtime_dirs.sh"; fi
 
 # ---------------------------------------------------------------- 业务数据根
 # 用户选了存储空间：先建符号链接（目标不可写就回落，不假装成功）
-data_mode="${wizard_data_mode:-keep}"      # keep|custom|default
-data_target="${wizard_data_dir:-}"
-prev_target="$(readlink "${DATA_ROOT}" 2>/dev/null || true)"
-
-# 0.1.25（官方 data-share 范式）：安装时平台会自动创建 config/resource 声明的共享目录，
-# 并**自动为应用运行用户授 ACL**。因此数据根**优先**取 TRIM_DATA_SHARE_PATHS（第一个路径），
-# 不再需要用户去「应用设置 → 访问权限」授权目录、也不需要 chown 兜底。
-# 0.1.26：卸载时把凭据快照存在 <数据根>/.appstate/ —— 重装时回填到 @appconf，
-# 否则新生成的 pg_password 与旧库不匹配 → 28P01 起不来。
-_stash_src=""
-for _cand in "${DATA_ROOT}/.appstate" "$(readlink -f "${DATA_ROOT}" 2>/dev/null)/.appstate"; do
-    [ -f "${_cand}/pg_password" ] && _stash_src="${_cand}" && break
-done
-if [ -n "${_stash_src}" ]; then
-    for f in pg_password credential_encryption_key; do
-        [ -f "${_stash_src}/${f}" ] && cp -a "${_stash_src}/${f}" "${CFG_DIR}/${f}" 2>/dev/null || true
-    done
-    chown "${TRIM_UID}:${TRIM_GID}" "${CFG_DIR}/pg_password" "${CFG_DIR}/credential_encryption_key" 2>/dev/null || true
-    chmod 600 "${CFG_DIR}/pg_password" "${CFG_DIR}/credential_encryption_key" 2>/dev/null || true
-    say "已从数据根回填凭据快照（pg_password / credential_encryption_key）"
-fi
-
+# 0.1.29：决策顺序**改用代码位组件** cmd/lib/data-dir-decision.sh::decide_data_dir（B1~B4 四分支）。
+#   本段只做接线：取参数 → 调函数 → 用 DECIDED_DATA_DIR / DECIDED_BRANCH；不自行改写判定逻辑。
 _share="${TRIM_DATA_SHARE_PATHS%%:*}"
-# 0.1.26：**空 share 不得夺走已有库**。只有当 share 里已有数据库，或当前数据根本无库（全新安装）时才切过去。
-_share_has_db=0
-[ -n "${_share}" ] && [ -d "${_share}/pgdata" ] && [ -n "$(ls -A "${_share}/pgdata" 2>/dev/null)" ] && _share_has_db=1
-_cur_has_db=0
-[ -d "${DATA_ROOT}/pgdata" ] && [ -n "$(ls -A "${DATA_ROOT}/pgdata" 2>/dev/null)" ] && _cur_has_db=1
-if [ -n "${_share}" ] && [ -d "${_share}" ] && [ "${data_mode}" != "custom" ] \
-   && { [ "${_share_has_db}" = "1" ] || [ "${_cur_has_db}" = "0" ]; }; then
-    if [ -L "${DATA_ROOT}" ] && [ "$(readlink -f "${DATA_ROOT}")" = "$(readlink -f "${_share}")" ]; then
-        say "数据根已是系统分配的共享目录：${_share}（data-share，无需授权）"
-    else
-        . "$(dirname "$0")/lib/data-root-migration.sh" 2>/dev/null \
-            || . "${APPDEST}/cmd/lib/data-root-migration.sh" 2>/dev/null \
-            || fail "缺少 data-root-migration.sh（fpk 打包不完整）"
-        if migrate_data_root "${DATA_ROOT}" "${_share}" "${APP_NAME}" "${APPDEST}/docker/docker-compose.yaml"; then
-            say "数据根：系统共享目录 ${_share}（data-share 自动授权，安装即可用）"
-        else
-            warn "无法把数据根切到 ${_share}，回落到默认目录（不影响启动）。"
-        fi
-    fi
-    printf "%s\n" "${_share}" > "${CFG_DIR}/data_target" 2>/dev/null || true
-    data_mode="share"
-elif [ -n "${_share}" ] && [ "${_cur_has_db}" = "1" ] && [ "${_share_has_db}" = "0" ]; then
-    warn "系统共享目录 ${_share} 是空的，而当前数据根已有数据库 → **保留现有数据**（不切到空 share）。"
-    warn "   若确实要迁到 share：先卸载（保留数据），把旧数据复制到 ${_share} 后重装，或手工迁移 pgdata。"
+_existing_root="$(readlink -f "${DATA_ROOT}" 2>/dev/null || echo "${DATA_ROOT}")"
+_wizard_dir="${wizard_data_dir:-}"
+if command -v decide_data_dir >/dev/null 2>&1; then
+    decide_data_dir "${_wizard_dir}" "${_share}" "${_existing_root}" say
+    say "决策=${DECIDED_BRANCH} → ${DECIDED_DATA_DIR}"
+    data_target="${DECIDED_DATA_DIR}"
+    case "${DECIDED_BRANCH}" in
+        B1*) data_mode="custom" ;;
+        B2*) data_mode="share" ;;
+        B3*) data_mode="keep" ;;   # 保留现有数据根：不动链接
+        B4*) data_mode="default" ; warn "替用户目录不可用且无 share，回退默认目录：${DECIDED_DATA_DIR}" ;;
+        *)   data_mode="${wizard_data_mode:-keep}" ;;
+    esac
+else
+    fail "缺少 cmd/lib/data-dir-decision.sh（fpk 打包不完整）"
 fi
 
 case "${data_mode}" in
@@ -125,6 +102,17 @@ case "${data_mode}" in
             fail "数据根设置失败：原有数据未被改动。请检查 ${data_target} 是否可写后重试。"
         fi
         say "数据根：${DATA_ROOT} -> ${data_target}"
+        ;;
+    share)
+        # 0.1.35（M1）：B2 系统共享目录真正落地（此前落入 *）什么都没做 → 数据进了 @appdata 私有目录）
+        _share_dir="${TRIM_DATA_SHARE_PATHS%%:*}"
+        if command -v apply_share_branch >/dev/null 2>&1; then
+            apply_share_branch "${_share_dir}" "${DATA_ROOT}" || fail "share 落地失败：${_share_dir}"
+            clear_data_target_memory "${CFG_DIR}/data_target" "${_share_dir}"
+            say "数据根（share 分支）：${DATA_ROOT} -> ${_share_dir}"
+        else
+            fail "缺少 cmd/lib/mustfix-0134.sh（fpk 打包不完整）"
+        fi
         ;;
     default)
         [ -L "${DATA_ROOT}" ] && rm -f "${DATA_ROOT}" && say "数据根恢复为应用自有目录：${DATA_ROOT}"
@@ -164,13 +152,28 @@ chmod 750 "${MAIL_DIR}" "${PG_DIR}" 2>/dev/null || true
 # ---------------------------------------------------------------- 密钥（幂等）
 gen_b64() { head -c "$1" /dev/urandom | base64 | tr -d '\n'; }
 
-if [ -s "${PG_PASS_FILE}" ]; then
-    say "沿用已有 PostgreSQL 密码（${PG_PASS_FILE}）"
-else
-    (umask 077; gen_b64 24 >"${PG_PASS_FILE}") || fail "写入 PostgreSQL 密码失败"
-    say "已生成 PostgreSQL 密码（${PG_PASS_FILE}，600）"
+# 0.1.32：口令三态由代码位组件 resolve_db_password 决定（new/existing），**同 shell 直接调用**
+# （不得用 $(…) 取值：会进子 shell 丢掉 PG_PASSWORD_SHOW_ONCE），结果从 ${PG_PASS_FILE} 读回。
+PG_PASSWORD_SHOW_ONCE=0
+_db_mode="new"
+case "${data_mode}" in
+    custom)
+        if command -v dir_has_db >/dev/null 2>&1 && dir_has_db "${data_target}"; then _db_mode="existing"; fi ;;
+    keep)  _db_mode="existing" ;;
+    share) if command -v dir_has_db >/dev/null 2>&1 && dir_has_db "${DATA_ROOT}"; then _db_mode="existing"; fi ;;
+esac
+say "数据库口令模式：${_db_mode}（向导是否填写：$([ -n "${wizard_db_password:-}" ] && echo 是 || echo 否)）"
+if ! command -v resolve_db_password >/dev/null 2>&1; then
+    fail "缺少 cmd/lib/pg-password-guard.sh（fpk 打包不完整）"
 fi
+resolve_db_password "${_db_mode}" "${wizard_db_password:-}" "${DATA_ROOT}" "${PG_PASS_FILE}" \
+    "${APP_NAME}-db" "mailarchiver" "mailarchiver" >/dev/null \
+    || fail "数据库口令解析失败：请按上方提示填写该库当初的数据库口令（不会擅自改库）。"
 chmod 600 "${PG_PASS_FILE}" 2>/dev/null || true
+# 0.1.34：完成页口令块改用代码位组件 print_db_credential_note（SHOW_ONCE=1 才打明文，否则只指纹）
+print_db_credential_note "$(head -n1 "${PG_PASS_FILE}" | tr -d '\r\n')" "${PG_PASSWORD_SHOW_ONCE:-0}"
+# 0.1.38：不再往 /vol1/1000 写明文文件（属主不符、也不需要）——明文就在 ${PG_PASS_FILE}（600）。
+say "如需查看明文：--show-db-password；只看指纹：--show-db-fingerprint"
 
 if [ -s "${CFG_DIR}/credential_encryption_key" ]; then
     CRED_KEY="$(head -n1 "${CFG_DIR}/credential_encryption_key")"
@@ -208,9 +211,8 @@ if [ "${_pw_from_wizard}" = "0" ] && [ -s "${_pw_file}" ]; then
     fi
 fi
 if [ -z "${ADMIN_PASS}" ]; then
-    ADMIN_PASS="change_me_$(date +%s)"
-    warn "向导未提供密码且无可用副本，已生成临时密码（请用 --reset-password 立即修改）。"
-    _pw_from_wizard=1
+    # 0.1.32：**删除占位符兜底**。管理员密码没有合理默认值，必须由用户在向导里提供。
+    fail "未设置管理员密码：请在安装向导的「管理员密码」里填写（≥8 位）。安装已中止，避免出现占位口令。"
 fi
 if [ "${_pw_from_wizard}" = "1" ]; then
     (umask 077; printf '%s\n' "${ADMIN_PASS}" >"${_pw_file}") || fail "写入管理员密码失败"
@@ -305,12 +307,36 @@ fi
 # 这里用真实值覆盖它们（权威副本仍在 @appconf）。载荷与容器内路径一致（compose 把 ${TRIM_APPDEST} 挂到同名路径）。
 install -m 600 "${APP_ENV}"      "${APPDEST}/docker/app.env"      || fail "渲染 ${APPDEST}/docker/app.env 失败"
 # 0.1.23 自检：载荷 LISTEN_UNIX_SOCKET 必须等于网关路径，不符即中止
+# 0.1.29：口令自检 = 代码位组件 v2（M1 解析引号/分号、M2 自愈分两条路，含只读试连库）。
+_pgf="${APPDEST}/docker/pg_password"
+# 0.1.32（顺序 + 判据双修）：**先回填真值**（模板置空后仍可能残留历史值），再自检。
+# 判据从「文件非空」改为「合规且与权威一致」，杜绝"模板 change_me 非空 ⇒ 跳过回填"的短路。
+backfill_pg_password "${_pgf}" "${PG_PASS_FILE}" >/dev/null \
+    || fail "载荷口令回填失败（权威口令不合规或缺失）"
+chown "${TRIM_UID}:${TRIM_GID}" "${_pgf}" 2>/dev/null || true
+say "口令自检：载荷副本已按权威值回填（len=$(tr -d '\r\n' < "${_pgf}" | wc -c)）"
+_conn="$(grep -m1 '^ConnectionStrings__DefaultConnection=' "${APPDEST}/docker/app.env" 2>/dev/null | cut -d= -f2-)"
+if command -v check_pg_password_file >/dev/null 2>&1; then
+    _dbh="${APP_NAME}-db"; [ -n "$(docker ps --format '{{.Names}}' 2>/dev/null | grep -x "${_dbh}")" ] || _dbh=""
+    check_pg_password_file "${_pgf}" "${_conn}" "${_dbh:-skip}" "mailarchiver" "mailarchiver" \
+        || fail "口令自检失败：见上方脱敏对比（仅真 mismatch 才中止；skip=新库首启放行）。"
+    say "口令自检通过（三态：skip/ok 放行，仅 mismatch 中止）"
+    if [ "${PG_ALIGN_PENDING:-0}" = "1" ]; then
+        say "检测到待对齐标记：PG_ALIGN_PENDING=1（库尚未运行，起库后将 ALTER ROLE 对齐一次）"
+    fi
+else
+    fail "缺少 cmd/lib/password-consistency.sh（fpk 打包不完整）"
+fi
 _lus="$(grep -m1 '^LISTEN_UNIX_SOCKET=' "${APPDEST}/docker/app.env" 2>/dev/null | cut -d= -f2-)"
 if [ -n "${_lus}" ] && [ "${_lus}" != "${SOCK_PATH}" ]; then
     fail "载荷 app.env 的 LISTEN_UNIX_SOCKET=${_lus} 与网关实际解析路径 ${SOCK_PATH}（target→@appcenter 同一 inode）不一致（会绑定失败/404）。已中止安装。"
 fi
 say "socket 路径自检通过：${_lus:-<未设置>}"
-install -m 600 "${PG_PASS_FILE}" "${APPDEST}/docker/pg_password"  || fail "渲染 ${APPDEST}/docker/pg_password 失败"
+# 0.1.32：真值复制已上移到自检**之前**（backfill_pg_password），此处不再重复写，
+# 并断言"自检读到的值 == 载荷最终值"，保证顺序不可逆。
+_chk="$(tr -d '\r\n' < "${_pgf}")"; _cfg="$(head -n1 "${PG_PASS_FILE}" | tr -d '\r\n')"
+[ "${_chk}" = "${_cfg}" ] || fail "顺序自检失败：载荷口令与权威口令不一致（不应发生）。"
+say "顺序自检通过（写值 → 自检 → 起容器，三者同源）"
 
 # ---------------------------------------------------------------- 运行期目录（权威：cmd/lib_runtime_dirs.sh）
 LIB_DIRS="$(dirname "$0")/lib_runtime_dirs.sh"
@@ -337,9 +363,38 @@ say "配置        : ${CFG_DIR}/{app.env,settings.env,pg_password,admin_password
 # 真实配置已写盘：立刻重建容器，否则它们还带着"冷启动占位 app.env"（socket 会落在 /tmp）
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     # 注意：安装/升级场景下重建容器是可接受的，但它会中断正在使用的会话
+    # 0.1.42：compose up **之前**校验目标库完整性（空壳/半截库会让 db 以 139 崩，用户只看到白页）
+    if command -v assert_pgdata_complete >/dev/null 2>&1; then
+        assert_pgdata_complete "${PG_DIR}" || fail "数据目录里的数据库不完整，安装已中止（未启动容器、未改动数据）。"
+    else
+        warn "缺少 assert_pgdata_complete（cmd/lib/pg-password-guard.sh 未加载）"
+    fi
     say "正在按真实配置重建容器（已有会话会中断约 1 分钟，数据不受影响）"
     docker compose -p "${APP_NAME}" -f "${APPDEST}/docker/docker-compose.yaml" up -d --force-recreate >/dev/null 2>&1 \
         && say "容器已按真实配置重建" || warn "compose up 失败，请稍后在应用中心启动一次"
+    # 0.1.41：顺序 = 起 db → 就绪（pg_isready）→【**无条件**幂等 ALTER ROLE 对齐】→ app 生效
+    # 不再依赖 PG_ALIGN_PENDING（该标志会被 resolve #1 采用 .appstate 等路径漏置 → 库没对齐就起 app）。
+    say "等待数据库就绪（pg_isready，最多 60s）…"
+    _i=0
+    while [ $_i -lt 30 ]; do
+        if command -v pg_isready >/dev/null 2>&1 \
+           && pg_isready -h "${APP_NAME}-db" -U mailarchiver -d mailarchiver >/dev/null 2>&1; then
+            break
+        fi
+        docker exec "${APP_NAME}-db" pg_isready -U mailarchiver >/dev/null 2>&1 && break
+        sleep 2; _i=$(( _i + 1 ))
+    done
+    if command -v db_alter_password >/dev/null 2>&1; then
+        say "库已就绪 → 执行一次 ALTER ROLE 对齐（幂等，仅改角色口令，不动数据）"
+        if db_alter_password "${APP_NAME}-db" "mailarchiver" "mailarchiver" "$(head -n1 "${PG_PASS_FILE}" | tr -d '\r\n')"; then
+            say "ALTER ROLE 对齐完成（新口令已在容器内经 TCP 验证通过）"
+        else
+            fail "ALTER ROLE 对齐失败（见上方 FAIL 与手工命令）。应用若继续启动将报 28P01，故中止安装。"
+        fi
+    else
+        fail "缺少 cmd/lib/pg-password-guard.sh 的 db_alter_password（fpk 打包不完整）"
+    fi
+    PG_ALIGN_PENDING=0
 fi
 
 # ---------------------------------------------------------------- 必修 3：账号已存在提示
@@ -347,12 +402,14 @@ fi
 if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${APP_NAME}-db$"; then
     _exists="$(docker exec -i "${APP_NAME}-db" psql -U mailarchiver -d mailarchiver -tA \
         -c "select count(*) from mail_archiver.\"Users\" where \"Username\"='${ADMIN_USER}'" 2>/dev/null | tr -d ' ')"
-    if [ "${_exists:-0}" != "0" ] && [ "${_exists:-0}" != "" ]; then
-        say "⚠️ 账号 ${ADMIN_USER} 已存在：**该密码不会改变**（只有首次创建的账号才用配置密码）。"
+    # 0.1.35（M2）：用 DB_HAS_USERS 互斥——同一次安装只出现一条口令来源提示
+    db_users_count_marker "${_exists:-0}"
+    if command -v print_account_origin >/dev/null 2>&1; then
+        say "$(print_account_origin)"
+    fi
+    if [ "${DB_HAS_USERS}" = "1" ]; then
         say "   如需改密码，请用包内命令：docker exec ${APP_NAME} dotnet MailArchiver.dll --reset-password ${ADMIN_USER}"
         trace "admin account already exists; password unchanged"
-    else
-        say "账号 ${ADMIN_USER} 为首次创建，将使用本次配置的密码。"
     fi
 fi
 
@@ -372,13 +429,15 @@ _last_action="$(head -n1 "${CFG_DIR}/last_uninstall_action" 2>/dev/null || true)
 # 判定**只基于应用标准数据根** ${VAR_DIR}/data；外部自定义目录不由应用管理，不参与判定、不会被删除。
 if command -v standard_root_has_db >/dev/null 2>&1 && standard_root_has_db "${DATA_ROOT}"; then
     _real="$(readlink -f "${DATA_ROOT}" 2>/dev/null || echo "${DATA_ROOT}")"
-    # 只有"标准数据根里确实还有数据库内容"才算删除没生效；空壳目录不算
-    if [ "${_last_action}" = "delete" ] && { [ -d "${DATA_ROOT}/pgdata" ] && [ -n "$(ls -A "${DATA_ROOT}/pgdata" 2>/dev/null)" ]; }; then
-        fail "上一次卸载选择的是「删除数据」，但标准数据根 ${DATA_ROOT} 仍然存在（${_real}）——说明删除没有生效。
-已中止安装，避免沿用旧账号导致"新密码登不进"。
-请确认后重试（若 ${_real} 是你自建的外部目录，请把 ${DATA_ROOT} 这个链接删掉再装）。"
+    # 0.1.30：防线改用代码位组件 data_root_defense_line（区分 share 链接 / 用户链接 / 真实目录含数据）。
+    if command -v data_root_defense_line >/dev/null 2>&1; then
+        data_root_defense_line "${DATA_ROOT}" "${_last_action}" || fail "上一次卸载选了「删除数据」，但 ${DATA_ROOT} 里仍有数据库；请先删除该目录后重试。"
+    else
+        warn "缺少 cmd/lib/data-root-defense.sh；跳过防线判定（不阻塞安装）。"
     fi
-    say "【态②·沿用】检测到已有数据库（${_real}/pgdata）：**将沿用原有账号与密码，本次向导里的密码不生效**。"
+    if [ "${DB_HAS_USERS:-}" = "1" ]; then
+        say "【态②·沿用】检测到已有数据库（${_real}/pgdata）：**将沿用原有账号与密码，本次向导里的密码不生效**。"
+    fi
     say "   本次向导里填写的管理员密码**不会生效**（账号已存在）。"
     if command -v standard_root_is_external >/dev/null 2>&1 && standard_root_is_external "${DATA_ROOT}"; then
         say "   注意：${DATA_ROOT} 是指向外部目录的符号链接，该目录**不由应用管理**；"

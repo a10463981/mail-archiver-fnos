@@ -16,7 +16,7 @@
 
 services:
   app:
-    image: mail-archiver-fnos:zh-39f59d2
+    image: mail-archiver-fnos:zh-39f59d2-p30
     container_name: mail-archiver-fnos
     # 非 root 运行：与宿主目录属主一致，避免 chown/权限问题
     user: "${TRIM_UID:?TRIM_UID missing}:${TRIM_GID:?TRIM_GID missing}"
