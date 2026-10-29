@@ -61,7 +61,7 @@ if [ "${data_mode}" = "custom" ]; then
                 _ensure_ok=1; break
             fi
             say "看护第 ${_try} 轮：容器/socket 未就绪，补一次启动…"
-            compose up -d >/dev/null 2>&1 || true
+            compose up -d --force-recreate >/dev/null 2>&1 || true
             sleep 5
         done
     fi
