@@ -10,6 +10,7 @@
 | 应用镜像 | `mail-archiver-fnos:zh-39f59d2-p30`（**已内嵌在 fpk 内**） |
 | 安装包 | `mail-archiver-fnos-26.10.01.fpk`，149,546,782 B，sha256 `969a54cd6d815bed930db7a9b972646cf2df7560ab7637b50d3da6ab643dd0ad` |
 | 许可 | GPL-3.0（见仓库 `LICENSE` / `NOTICE`） |
+| 架构 | x86_64（`build/manifest` 记 `platform = x86`，fnOS 的 x86 即 x86_64）、`os_min_version = 1.2.0401` |
 
 ## 一、前置条件
 
@@ -61,7 +62,7 @@ docker logs --tail 200 mail-archiver-fnos      # 应用日志（唯一位置）
 docker logs --tail 100 mail-archiver-fnos-db   # 数据库日志
 ```
 
-`@appdata/mail-archiver-fnos/logs` 未使用（应用只写 stdout）；应用内「日志」页是访问审计，不是运行日志。更多见 [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md)。
+`@appdata/mail-archiver-fnos/logs` 虽挂载到容器 `/data/logs`，但运行日志以 stdout 为主；应用内「日志」页是访问审计，不是运行日志。更多见 [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md)。
 
 ## 八、已知边界
 
@@ -75,7 +76,7 @@ docker logs --tail 100 mail-archiver-fnos-db   # 数据库日志
   发布序号   = 01（首个正式发布；后续 02、03…）
 ```
 
-历史 `0.1.x` 与开发期 `26.10.4x` 编号**仅作历史记录**，对应关系见 [`../VERSION-MAP.md`](../VERSION-MAP.md)，**请勿据此下载**（仓库只有 `26.10.01` 一个 Release）。
+仓库当前**只有 `26.10.01` 一个 Release**；请按上面的规则识别版本，其余编号（旧编号或开发期编号）均已作废，不要据此寻找安装包。
 
 ---
 

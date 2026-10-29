@@ -12,7 +12,7 @@
 {"data-share": {"shares": [{"name": "mail-archiver/data"}]}}
 ```
 - 安装时系统建目录 + 授权给应用用户 `987`；
-- 应用通过 `TRIM_DATA_SHARE_PATHS`（或 `/var/apps/<app>/share/...`）拿到路径；
+- 应用从平台注入的环境变量 `TRIM_DATA_SHARE_PATHS` 取数据根（冒号分隔取第一段，即 `${TRIM_DATA_SHARE_PATHS%%:*}`）；
 - **不需要**用户在设置页授权、**不需要** `chown`、**不需要**二次重装。
 
 ## 卸载语义
@@ -24,10 +24,20 @@
 安装脚本本身不删共享目录，但**平台在「删除数据」时会清掉 `data-share`**，脚本无法拦截。因此**卸载前务必先备份**（`pg_dump` 或整目录复制到你自己的位置）。
 
 ## socket 落点（当前版本）
+
 官方 `docs/core-concepts/gateway-registration.md`：
 > `gatewaySocket` 只填写 Socket 文件名（如 app.sock）。**Socket 文件应放在已安装应用的 target 目录下。**
 
-因此应用只监听 **`/var/apps/<app>/target/app.sock`**（`target → @appcenter/<app>`）。旧版曾把 socket 写到 `@appcenter` 裸路径，网关按 `target/app.sock` 解析时可能失败 → **页面 404**。**不要改回非 target 路径。**
+对应到打包层的真实值：
+
+| 项 | 实际值 | 出处 |
+|---|---|---|
+| 容器监听的 socket | `LISTEN_UNIX_SOCKET=<TRIM_APPCENTER>/app.sock`（默认 `/vol1/@appcenter/mail-archiver-fnos/app.sock`） | `build/cmd/install_callback:31,238`、`build/app/docker/app.env` |
+| 网关解析路径 | `/var/apps/<app>/target/app.sock`（`target` 为平台符号链接 → `@appcenter/<app>`，**同一 inode**） | 同上注释与安装期自检 |
+| TCP 端口 | **不发布任何端口**（compose 无 `ports:`） | `build/app/docker/docker-compose.yaml` |
+| 权限 | 启动后收紧为 `0600`（`main` 另有看护兜底） | `build/cmd/main` 的 `watch_socket()` |
+
+安装期会自检：载荷 `app.env` 里的 `LISTEN_UNIX_SOCKET` 与网关解析路径不一致就**中止安装**（避免绑定失败 / 页面 404）。**不要把 socket 改到非 target 路径。**
 
 ## 官方 API（为什么不接）
 `trim.file.checkUserACL` / `convertPath` / `getPlatformConfig` 实测返回 `200006 Internal Error`（当前系统不可用），且需要 `config/resource` 声明 `api-scope` + App≥1.34.0。改用 `data-share` 后**也已经不需要**它们。（研究记录未随本仓库发布。）

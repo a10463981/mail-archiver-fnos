@@ -5,7 +5,7 @@
 docker logs --tail 200 mail-archiver-fnos        # 应用日志（唯一位置）
 docker logs --tail 100 mail-archiver-fnos-db     # 数据库日志
 ```
-- `@appdata/mail-archiver-fnos/logs` **目前未使用**（应用只写 stdout）
+- `@appdata/mail-archiver-fnos/logs` 已挂载到容器 `/data/logs`，但应用运行日志以 **stdout** 为主；排障请用上面的 `docker logs`
 - 应用内「日志」页是**访问审计**（`AccessLogs` 表），不是应用运行日志
 
 ## 常见现象

@@ -34,7 +34,7 @@
 
 - **安装日志里的管理员口令是掩码形式**（如 `Ma****6!`），不含明文；口令在库里**只存哈希，无法查看、只能重置**（应用设置 → 运行设置 → 管理员登录密码）。
 - **请勿截图或外传安装日志**；向他人求助排障时，先确认日志与截图中不含账号、口令、邮箱地址。
-- 应用日志查看：`docker logs --tail 200 mail-archiver-fnos`（**不是** `data/logs`，该目录未使用），详见 [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)。
+- 应用日志查看：`docker logs --tail 200 mail-archiver-fnos`（`data/logs` 虽已挂载但运行日志以 stdout 为主），详见 [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)。
 
 ## 卸载：选「保留数据」还是「删除数据」
 
