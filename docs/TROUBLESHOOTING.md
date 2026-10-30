@@ -8,6 +8,16 @@ docker logs --tail 100 mail-archiver-fnos-db     # 数据库日志
 - `@appdata/mail-archiver-fnos/logs` 已挂载到容器 `/data/logs`，但应用运行日志以 **stdout** 为主；排障请用上面的 `docker logs`
 - 应用内「日志」页是**访问审计**（`AccessLogs` 表），不是应用运行日志
 
+## 卸载 / 清理会删什么（实测）
+
+| 操作 | `@appdata` 应用自有目录 | `@appshare`（data-share 默认位置） | `/vol1/1000/...` 用户指定目录 |
+|---|---|---|---|
+| 卸载 · 保留数据 | 保留 | **不删**（实测无 DeleteFile） | 不删 |
+| 卸载 · 删除数据 | 删（仅删链接与私有目录；目标不动） | **不删**（09:34 实测，`last_uninstall_action=delete`） | 不删 |
+| 应用中心「删除数据 / 清理残留」 | 删 | **会被删**（22:10 / 22:34 / 22:44 / 00:04 四次实测） | 不删 |
+
+> 普通卸载（两种选项）不删 `@appshare`；「删除数据 / 清理残留」或手动删才会删。
+
 ## 常见现象
 
 | 现象 | 处理 |
