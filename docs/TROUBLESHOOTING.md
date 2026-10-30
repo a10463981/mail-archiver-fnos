@@ -1,5 +1,16 @@
 # 排障（适用于 26.10.01）
 
+## ⚠ 升级 / 重装后白屏、点「允许 / 拒绝」没反应、反复回到授权页（最常见，先看这条）
+
+| 项 | 内容 |
+|---|---|
+| **现象** | 升级或重装后，打开应用白屏；点授权页的「允许 / 拒绝」没有反应，或一直跳回授权页 |
+| **判据** | `docker logs mail-archiver-fnos 2>&1 | grep -E "key ring|antiforgery"` 有命中，例如 `The key {…} was not found in the key ring` 或 `The antiforgery token could not be decrypted` |
+| **处置（10 秒）** | 用**无痕窗口**打开应用；或清除该站点的 Cookie（浏览器 → 站点设置 → 清除数据）后重新打开。清完通常直接就能进 |
+| **原因** | 浏览器里存着**旧版本签发的 Cookie**，重装会**更换数据保护密钥**，旧 Cookie 无法解密 → 表单提交被拒（服务端返回 400 空响应）→ 表现为白页 / 卡在授权页 |
+
+> 这与应用数据无关，**不需要卸载重装**，也不会丢数据；清 Cookie 即可。
+
 ## 日志在哪
 ```bash
 docker logs --tail 200 mail-archiver-fnos        # 应用日志（唯一位置）

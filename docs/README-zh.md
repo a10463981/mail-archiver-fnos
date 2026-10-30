@@ -85,6 +85,8 @@ docker logs --tail 100 mail-archiver-fnos-db   # 数据库日志
 
 ## 八、已知边界
 
+- **升级 / 重装后白屏、点授权没反应**：先试**无痕窗口**或清除该站点 Cookie（旧 Cookie 无法被新密钥解密，日志会写 `was not found in the key ring`）；不是数据问题，**不需要卸载重装**。
+
 见 [`KNOWN-ISSUES.md`](KNOWN-ISSUES.md)：免密登录真机覆盖待确认、跨用户隔离未验证、镜像层结构与上游不同、卸载删数据会连带 `data-share`。
 
 ## 九、版本号规则

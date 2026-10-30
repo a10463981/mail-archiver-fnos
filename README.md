@@ -36,6 +36,10 @@
 - **请勿截图或外传安装日志**；向他人求助排障时，先确认日志与截图中不含账号、口令、邮箱地址。
 - 应用日志查看：`docker logs --tail 200 mail-archiver-fnos`（`data/logs` 虽已挂载但运行日志以 stdout 为主），详见 [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)。
 
+## 升级 / 重装后白屏、点授权没反应？
+
+**先试无痕窗口**（或清除该站点 Cookie）——多半是旧版本 Cookie 无法被新密钥解密，日志会写 `was not found in the key ring`。无需卸载重装，也不丢数据；详见 [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)。
+
 ## 卸载与数据：会删什么、不会删什么（终版实测结论）
 
 | 操作 | `@appdata` 应用自有目录 | `@appshare`（data-share 默认位置） | `/vol1/1000/...` 用户指定目录 |
