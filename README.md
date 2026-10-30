@@ -78,6 +78,8 @@
 
 ## 文档
 
+- [架构与拓扑（含 6 张 Mermaid 图）](docs/ARCHITECTURE.md)
+
 | 文档 | 内容 |
 |---|---|
 | [`docs/INSTALL-zh.md`](docs/INSTALL-zh.md) | 安装说明（向导字段、首登改密、残留处理） |
