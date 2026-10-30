@@ -1,16 +1,16 @@
 # 安装说明（Mail-archiver for fnOS）
 
-> 适用于 **26.10.01（正式首发）** 及后续 `26.10.x` 版本。安装包从 [Releases](https://github.com/a10463981/mail-archiver-fnos/releases) 下载（仓库只有 `26.10.01` 一个 Release）。
+> 适用于 **26.10.04**（当前版本）及后续 `26.10.x` 版本。安装包从 [Releases](https://github.com/a10463981/mail-archiver-fnos/releases/latest) 下载。
 
 ## 一、前置条件
 
 - fnOS 系统版本 **≥ 1.2.0401**，架构 **x86_64**，内存建议 **≥ 4GB**
-- 应用镜像**已内嵌在安装包内**（离线 `docker load`）；**唯一联网点是数据库镜像 `postgres:16-alpine`**，离线环境请先 `docker pull postgres:16-alpine`
+- **无需联网**：应用镜像与数据库镜像 `postgres:16-alpine` **均已内嵌**在安装包内（离线 `docker load`，`pull_policy: never`）
 
 ## 二、安装步骤
 
-1. 校验安装包：`sha256sum -c SHA256SUM.txt`（应为 `969a54cd…`）
-2. 应用中心 → **手动安装** → 选择 `mail-archiver-fnos-26.10.01.fpk`
+1. 校验安装包：`sha256sum -c SHA256SUM-26.10.04.txt`（应为 `7408988e…`）。校验文件名随版本号变化（`SHA256SUM-<版本>.txt`），以 Release 页面实际资产名为准。
+2. 应用中心 → **手动安装** → 选择 `mail-archiver-fnos-26.10.04.fpk`
 3. 向导填写：管理员用户名、**管理员密码（仅首次建库生效）**、时区（如 `Asia/Shanghai`）；**数据目录可留空**（走系统共享目录），要用数据盘再指定（如 `/vol2/1000/...`）
 4. 完成 → **启动** → 从**桌面**打开「邮件归档」
 
@@ -59,4 +59,4 @@
 
 ---
 
-最后更新：**26.10.01**
+最后更新：**26.10.04**

@@ -20,10 +20,11 @@
 
 ## 从 Releases 下载并安装（三步）
 
-1. 打开 [**Releases**](https://github.com/a10463981/mail-archiver-fnos/releases/latest) → 下载 `mail-archiver-fnos-26.10.04.fpk` 和 `SHA256SUM.txt`（最新版）。
+1. 打开 [**Releases**](https://github.com/a10463981/mail-archiver-fnos/releases/latest) → 下载 `mail-archiver-fnos-26.10.04.fpk` 和 `SHA256SUM-26.10.04.txt`（最新版）。
+   > 校验文件名随版本号变化（`SHA256SUM-<版本>.txt`），以 Release 页面实际资产名为准。
 2. **校验**（建议，应为 `7408988e…`）：
    ```bash
-   sha256sum -c SHA256SUM.txt        # Linux / macOS
+   sha256sum -c SHA256SUM-26.10.04.txt   # Linux / macOS（文件名随版本号变化，以 Release 实际资产名为准）
    certutil -hashfile mail-archiver-fnos-26.10.04.fpk SHA256   # Windows
    ```
 3. fnOS **应用中心 → 手动安装 → 选择 .fpk** → 向导填管理员账号 / 密码 / 时区 → 完成 → **启动** → 安装完成后从**桌面打开**应用。
