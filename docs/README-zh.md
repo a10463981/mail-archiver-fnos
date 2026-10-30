@@ -37,17 +37,33 @@
 
 - 默认放在系统分配的**共享目录**（`data-share`），安装时由 fnOS 自动创建并授权，**不需要**手工授权或 `chown`。
 - 想放到数据盘（如 `/vol2/1000/...`），在**安装向导**里指定即可。
-- **运行期不支持热切换**：Docker 需要在容器启动时 bind 挂载该目录，热切换意味着服务中断与搬数据风险。更换方式 = **卸载（保留数据）→ 重装时指定新目录**。
+- **运行期不支持热切换**：Docker 需要在容器启动时 bind 挂载该目录，热切换意味着服务中断与搬数据风险。更换方式 = **先 `pg_dump` 导出 → 卸载 → 重装时指定新目录 → `pg_restore` 恢复**。
 - 详细说明：[`DATA-DIR-SWITCH.md`](DATA-DIR-SWITCH.md)、[`DATA-DIRECTION.md`](DATA-DIRECTION.md)、[`MULTI-DISK.md`](MULTI-DISK.md)。
 
-## 五、卸载语义（务必看清）
+## 五、卸载语义（实测结论）
 
-| 选项 | 应用自有数据根 `@appdata/mail-archiver-fnos/data` | 系统共享目录（`data-share`） | 你自己的存储目录（数据根为符号链接时） |
-|---|---|---|---|
-| **保留数据** | 保留 | 保留 | 保留链接与目标 |
-| **删除数据** | 删除 | ⚠ **平台会连同 `data-share` 一起删除** | 只删符号链接本身，目标目录不动 |
+| 卸载选项 | `@appdata` 应用自有目录 | `@appshare`（data-share 默认位置） | `/vol1/1000/...` 用户指定目录 | `.appstate` 快照 |
+|---|---|---|---|---|
+| **保留数据** | 保留 | **平台会删** | 平台不删 | 可能被删 |
+| **删除数据** | 删 | **平台会删** | 平台不删 | 删 |
 
-> ⚠ **卸载前务必先备份**（`pg_dump` 或把整个数据目录复制到你自己的位置）。平台在「删除数据」时会一并删除共享目录，安装脚本无法拦截。
+> **谁删了什么（实测结论，非推测）**：应用脚本只删应用自有目录 `@appdata/mail-archiver-fnos/data`（且仅当你选「删除数据」）；对 `@appshare` 只有读、唯一写操作是 `mkdir`。卸载窗口内 `@appshare` / `@appconf` / `@apphome` / `@appdata` 是**平台**按 `MAINEVENT DeleteFile` 依次清掉的（`uid=1000`，发生在 `app.uninstalling → APP_UNINSTALLED` 之间），**与「保留数据 / 删除数据」的选择无关**。
+> **软件不做任何"自动清理用户数据"的动作**：删库、删目录一律由你手动执行。
+
+### 保住数据的推荐做法
+
+1. **重要数据放个人目录**：安装向导「数据目录（可选）」填 `/vol1/1000/mail-archive`（或 `/vol2/1000/mail-archive`）。平台卸载只清应用关联目录，**不删你自己的目录**。
+2. **卸载 / 升级前先导出 dump**（数据在默认共享目录时尤其必要）：
+   ```bash
+   docker exec mail-archiver-fnos-db sh -c 'pg_dump -Fc -U mailarchiver -f /tmp/mailarchiver.dump mailarchiver'
+   docker cp mail-archiver-fnos-db:/tmp/mailarchiver.dump /vol1/1000/mail-archive/backup-$(date +%F).dump
+   ```
+   若提示需要口令，用 `--show-db-password` 查看（只在终端显示，**勿贴聊天或截图**）。恢复：
+   ```bash
+   docker cp /vol1/1000/mail-archive/backup-2026-10-30.dump mail-archiver-fnos-db:/tmp/restore.dump
+   docker exec mail-archiver-fnos-db sh -c 'pg_restore -U mailarchiver -d mailarchiver --clean --if-exists /tmp/restore.dump'
+   ```
+3. ⚠ **不要依赖「保留数据」这个选项来保住 share 里的数据**——卸载时平台会删 `@appshare/<app>`，与应用日志里"已保留"的提示无关。
 
 ## 六、密码（两条不要混）
 

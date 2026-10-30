@@ -18,6 +18,8 @@ docker logs --tail 100 mail-archiver-fnos-db     # 数据库日志
 | 忘记密码 | 设置页「重置管理员登录密码」/ `--reset-password` / 网关故障先 `--unbind` |
 | 后台功能"不动了"（同步/统计） | `docker logs mail-archiver-fnos 2>&1 \| grep -c "failed and will not continue"` >0 → 重启容器 |
 | 应用起不来 | `docker ps -a`、`docker logs mail-archiver-fnos-db`、`df -h`、`ls -ld @appdata/mail-archiver-fnos/data/pgdata` |
+| 卸载后 `@appshare/mail-archiver` 里的数据不见了 | **平台在卸载流程里删的**（与「保留数据/删除数据」无关），应用脚本不删 share。能救的只有之前导出的 dump：装好后 `pg_restore`；以后把数据目录指到 `/vol1/1000/...` |
+| 升级后发现邮件全没了 | 同上——升级走的是卸载流程，`@appshare` 被平台清掉。升级前必须 `pg_dump`（命令见 [`UPGRADE-UNINSTALL.md`](UPGRADE-UNINSTALL.md)） |
 
 ## 健康指标（正常使用时应为 0）
 ```bash
