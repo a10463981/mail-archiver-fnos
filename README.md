@@ -36,36 +36,40 @@
 - **请勿截图或外传安装日志**；向他人求助排障时，先确认日志与截图中不含账号、口令、邮箱地址。
 - 应用日志查看：`docker logs --tail 200 mail-archiver-fnos`（`data/logs` 虽已挂载但运行日志以 stdout 为主），详见 [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)。
 
-## 卸载：数据会怎样（实测结论）
+## 卸载与数据：会删什么、不会删什么（实测结论）
 
-| 卸载选项 | `@appdata` 应用自有目录 | `@appshare`（data-share 默认位置） | `/vol1/1000/...` 用户指定目录 | `.appstate` 快照 |
+| 操作 | `@appdata` 应用自有目录 | `@appshare`（data-share 默认位置） | `/vol1/1000/...` 用户指定目录 | `.appstate` 快照 |
 |---|---|---|---|---|
-| **保留数据** | 保留 | **平台会删** | 平台不删 | 可能被删 |
-| **删除数据** | 删 | **平台会删** | 平台不删 | 删 |
+| 卸载（选「保留数据」） | 保留 | **不删**（实测窗口内无删除事件） | 不删 | 可能被删 |
+| 卸载（选「删除数据」） | 删 | **会被删**（实测 `MAINEVENT DeleteFile`） | 不删 | 删 |
+| 应用中心「删除数据 / 清理」类操作 | 删 | **会被删**（实测 `MAINEVENT DeleteFile`） | 不删 | 删 |
 
-> **谁删了什么（实测结论，非推测）**：应用脚本只删应用自有目录 `@appdata/mail-archiver-fnos/data`（且仅当你选「删除数据」）；对 `@appshare` 只有读、唯一写操作是 `mkdir`。卸载窗口内 `@appshare` / `@appconf` / `@apphome` / `@appdata` 是**平台**按 `MAINEVENT DeleteFile` 依次清掉的（`uid=1000`，发生在 `app.uninstalling → APP_UNINSTALLED` 之间），**与「保留数据 / 删除数据」的选择无关**。
-> **软件不做任何"自动清理用户数据"的动作**：删库、删目录一律由你手动执行。
+> **谁删了什么（两次实测对照，非推测）**
+> - **`08:58` 那次卸载**：整个窗口（08:50–09:30）**没有任何 `MAINEVENT DeleteFile`**，只有 `APP_UNINSTALLED`；`09:04` 重装直接复用同一份库 → **卸载本身不动 `@appshare`**。
+> - **`00:04:48` 那次「删除数据 / 清理」**：出现 `MAINEVENT DeleteFile vol1/@appshare/mail-archiver`（`uid=1000`），同一批把 `@appconf` / `@apphome` / `@appdata` 一起删 → **删 share 的是「删除数据 / 清理」这类操作**。
+> - 应用脚本本身**从不删 share**：代码里对 `@appshare` 只有 `mkdir`，`purge_standard_data_root` 只删 `${TRIM_PKGVAR}/data`；卸载时日志会打印"已保留数据 / 系统共享目录同样保留"。
+> - ⚠ **应用日志说"已保留" ≠ 平台一定不删**：日志只证明应用脚本没删；平台侧要看有没有 `MAINEVENT DeleteFile`。两件事分开看。
+> - **软件不做任何"自动清理用户数据"的动作**：删库、删目录一律由你手动执行。
 
 ### 保住数据的推荐做法
 
-1. **重要数据放个人目录**：安装向导「数据目录（可选）」填 `/vol1/1000/mail-archive`（或 `/vol2/1000/mail-archive`）。平台卸载只清应用关联目录，**不删你自己的目录**。
-2. **卸载 / 升级前先导出 dump**（数据在默认共享目录时尤其必要）：
+1. **重要数据放个人目录**：安装向导「数据目录（可选）」填 `/vol1/1000/mail-archive`（或 `/vol2/1000/mail-archive`）。平台对这类个人目录**不删**。
+2. **重大操作前先导出 dump**（卸载 / 升级 / 清理之前都做）：
    ```bash
    docker exec mail-archiver-fnos-db sh -c 'pg_dump -Fc -U mailarchiver -f /tmp/mailarchiver.dump mailarchiver'
    docker cp mail-archiver-fnos-db:/tmp/mailarchiver.dump /vol1/1000/mail-archive/backup-$(date +%F).dump
-   ```
-   若提示需要口令，用 `--show-db-password` 查看（只在终端显示，**勿贴聊天或截图**）。恢复：
-   ```bash
+   # 恢复
    docker cp /vol1/1000/mail-archive/backup-2026-10-30.dump mail-archiver-fnos-db:/tmp/restore.dump
    docker exec mail-archiver-fnos-db sh -c 'pg_restore -U mailarchiver -d mailarchiver --clean --if-exists /tmp/restore.dump'
    ```
-3. ⚠ **不要依赖「保留数据」这个选项来保住 share 里的数据**——卸载时平台会删 `@appshare/<app>`，与应用日志里"已保留"的提示无关。
+   需要口令时用 `--show-db-password` 查看（只在终端显示，**勿贴聊天或截图**）。
+3. ⚠ **不要依赖「保留数据」当备份**：它只说明应用脚本没删 `@appdata`，对 `@appshare` 不构成保证，也挡不住平台的「删除数据 / 清理」操作。**备份只能靠自己。**
 
 ## 数据目录说明（改目录 ≠ 搬数据）
 
 - 数据默认放在系统分配的**共享目录**（`config/resource` 的 `data-share`），安装时由 fnOS 自动创建并授权，**不需要**手工授权或 `chown`。
 - 想把数据放到数据盘（如 vol2），请在**安装向导**里指定；**运行期不支持热切换**（刻意设计，避免服务中断与数据搬家风险）。
-- **改数据目录不会搬运已有数据**：新位置是空库（详见 `docs/DATA-DIRECTION.md`、`docs/DATA-DIR-SWITCH.md`）。换位置的正确顺序：**先 `pg_dump` 导出 → 卸载 → 重装时指定新目录 → `pg_restore` 恢复**（数据在默认共享目录时，不导出就会随卸载丢失）。
+- **改数据目录不会搬运已有数据**：新位置是空库（详见 `docs/DATA-DIRECTION.md`、`docs/DATA-DIR-SWITCH.md`）。换位置的正确顺序：**先 `pg_dump` 导出 → 卸载（选「保留数据」，别点「删除数据 / 清理」）→ 重装时指定新目录 → `pg_restore` 恢复**。
 
 ## 版本与可复现构建
 
