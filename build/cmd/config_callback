@@ -12,7 +12,10 @@ SETTINGS="${CFG_DIR}/settings.env"
 # 0.1.44：APPDEST 为空时曾拼成 /docker/docker-compose.yaml → "exit status 1: open /docker/…"（装不上）。
 # 这里只加缺省兜底，非空时行为完全不变。
 APPDEST="${APPDEST:-/vol1/@appcenter/${APP_NAME}}"
-COMPOSE_FILE="${APPDEST:-/vol1/@appcenter/${APP_NAME}}/docker/docker-compose.yaml"
+for _l in resolve-appdest.sh; do [ -r "$(dirname "$0")/lib/${_l}" ] && . "$(dirname "$0")/lib/${_l}" 2>/dev/null || true; done
+_RC=0
+resolve_compose_file config_callback || _RC=$?
+if [ "$_RC" = "2" ]; then echo "note: compose 缺失，运行设置继续（保存类操作不需要 compose）。" >&2; fi
 DATA_ROOT="${VAR_DIR}/data"
 
 say() { echo "[${APP_NAME}] $*"; }

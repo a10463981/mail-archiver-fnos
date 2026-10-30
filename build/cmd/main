@@ -4,14 +4,32 @@
 set -u
 
 APP_NAME="${APP_NAME:-mail-archiver-fnos}"
-APPDEST="${TRIM_APPDEST:-}"   # set -u 下未定义会直接崩，兜底必须先取到空串
-VAR_DIR="${TRIM_PKGVAR}"
-CFG_DIR="${TRIM_PKGETC}"
+# 26.10.03：APPDEST 三级兜底统一走组件（防平台未注入 TRIM_APPDEST 时拼成 /docker/...）
+for _l in resolve-appdest.sh; do
+    [ -r "$(dirname "$0")/lib/${_l}" ] && . "$(dirname "$0")/lib/${_l}" 2>/dev/null || true
+done
+if command -v resolve_appdest >/dev/null 2>&1; then
+    set +u; APPDEST="$(resolve_appdest main)" || APPDEST=""; set -u
+else
+    APPDEST="${TRIM_APPDEST:-}"
+fi
+[ -n "${APPDEST}" ] || APPDEST="/vol1/@appcenter/${APP_NAME}"
+VAR_DIR="${TRIM_PKGVAR:-/vol1/@appdata/${APP_NAME}}"
+CFG_DIR="${TRIM_PKGETC:-/vol1/@appconf/${APP_NAME}}"
 LOG_FILE="${TRIM_TEMP_LOGFILE:-${TRIM_PKGVAR:-/tmp}/lifecycle.log}"
 # 0.1.44：APPDEST 为空时曾拼成 /docker/docker-compose.yaml → "exit status 1: open /docker/…"（装不上）。
 # 这里只加缺省兜底，非空时行为完全不变。
 APPDEST="${APPDEST:-/vol1/@appcenter/${APP_NAME}}"
-COMPOSE_FILE="${APPDEST:-/vol1/@appcenter/${APP_NAME}}/docker/docker-compose.yaml"
+# 26.10.03：compose 缺失不再硬失败（平台会把 main 非零退出当成安装失败→自动卸载+删 share）
+_RC=0
+resolve_compose_file main || _RC=$?
+if [ "$_RC" = "1" ]; then fail "无法解析应用目录（APPDEST），请检查平台是否注入 TRIM_APPDEST"; fi
+if [ "$_RC" = "2" ]; then
+    case "${1:-status}" in
+        start|stop) fail "compose 文件缺失，无法 ${1}" ;;
+        *) echo "note: compose 文件缺失，子命令 ${1:-status} 跳过容器操作（不视为安装失败）。" >&2; exit 0 ;;
+    esac
+fi
 SOCK="${APPDEST}/app.sock"
 
 say() { echo "[${APP_NAME}] $*"; }

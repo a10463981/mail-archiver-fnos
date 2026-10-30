@@ -2,7 +2,7 @@
 
 **Mail-archiver 的 fnOS（飞牛 NAS）打包版**：`.fpk` 一键安装，在 NAS 上归档、检索个人与团队邮件。
 
-> 当前版本：**26.10.01**（正式首发；版本号规则 `<上游发布线>.<我方发布序号>`，镜像基线上游 `39f59d2` = 官方 `26.10.1`）；对应表见 [`VERSION-MAP.md`](VERSION-MAP.md)。
+> 当前版本：**26.10.04**（版本号规则 `<上游发布线>.<我方发布序号>`，镜像基线上游 `39f59d2` = 官方 `26.10.1`）；对应表见 [`VERSION-MAP.md`](VERSION-MAP.md)。
 
 - 上游项目：[s1t5/mail-archiver](https://github.com/s1t5/mail-archiver)（作者 **s1t5**），基线 commit **`39f59d2`**
 - 本仓库是上游的 **fnOS 打包修改分发版**，修改内容全部以补丁形式给出（`patches/`），**按 GPL-3.0 分发**（见 [`LICENSE`](LICENSE)、[`NOTICE`](NOTICE)）
@@ -16,15 +16,15 @@
 | 架构 | **x86_64** |
 | 内存 | 建议 **≥ 4GB**（应用 + PostgreSQL 容器） |
 | 磁盘 | 按邮件量预留；数据库与附件都在数据目录内 |
-| 网络 | 安装包**内嵌应用镜像**（离线 `docker load`），唯一联网点是拉取数据库镜像 `postgres:16-alpine` |
+| 网络 | **无需联网**：应用镜像与 `postgres:16-alpine` 均已内嵌（离线 `docker load`，`pull_policy: never`） |
 
 ## 从 Releases 下载并安装（三步）
 
-1. 打开 [**Releases**](https://github.com/a10463981/mail-archiver-fnos/releases)（当前只有 **`26.10.01`**）→ 下载 `mail-archiver-fnos-26.10.01.fpk` 和 `SHA256SUM.txt`。
-2. **校验**（建议，应为 `969a54cd…`）：
+1. 打开 [**Releases**](https://github.com/a10463981/mail-archiver-fnos/releases/latest) → 下载 `mail-archiver-fnos-26.10.04.fpk` 和 `SHA256SUM.txt`（最新版）。
+2. **校验**（建议，应为 `7408988e…`）：
    ```bash
    sha256sum -c SHA256SUM.txt        # Linux / macOS
-   certutil -hashfile mail-archiver-fnos-26.10.01.fpk SHA256   # Windows
+   certutil -hashfile mail-archiver-fnos-26.10.04.fpk SHA256   # Windows
    ```
 3. fnOS **应用中心 → 手动安装 → 选择 .fpk** → 向导填管理员账号 / 密码 / 时区 → 完成 → **启动** → 安装完成后从**桌面打开**应用。
 
@@ -104,4 +104,4 @@
 
 ---
 
-最后更新：**26.10.01**（镜像 `zh-39f59d2-p30`，fpk 149,546,782 B，sha256 `969a54cd…`）
+最后更新：**26.10.04**（镜像 `zh-39f59d2-p33`，fpk 264,924,613 B，sha256 `7408988e…`）

@@ -16,7 +16,10 @@
 
 services:
   app:
-    image: mail-archiver-fnos:zh-39f59d2-p30
+    image: mail-archiver-fnos:zh-39f59d2-p33
+    # 0.1.46/26.10.02：镜像内嵌在 fpk 里（images/*.tar 由 install_init/callback load），
+    # 禁止 compose 自行 pull —— 离线环境拉取必失败。
+    pull_policy: never
     container_name: mail-archiver-fnos
     # 非 root 运行：与宿主目录属主一致，避免 chown/权限问题
     user: "${TRIM_UID:?TRIM_UID missing}:${TRIM_GID:?TRIM_GID missing}"
@@ -70,6 +73,9 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    # 0.1.46/26.10.02：postgres:16-alpine 一并内嵌（images/postgres-16-alpine.tar），
+    # 安装期 docker load；禁止 compose 自行 pull。
+    pull_policy: never
     container_name: mail-archiver-fnos-db
     # 与 app 同一 uid：pgdata 属主一致，避免 initdb 失败
     user: "${TRIM_UID:?TRIM_UID missing}:${TRIM_GID:?TRIM_GID missing}"

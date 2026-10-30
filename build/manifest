@@ -1,7 +1,7 @@
 appname                    = mail-archiver-fnos
-version                    = 26.10.01
+version                    = 26.10.04
 display_name               = 邮件归档
-desc                       = <p>Mail-archiver 邮件归档与检索服务（中文版）。</p><p>从桌面图标打开即免二次登录：应用通过 fnOS 统一网关读取当前登录用户身份，首次进入时输入一次 Mail-archiver 账户密码完成绑定，之后自动登录。</p><p>数据默认存放在官方共享目录（data-share，安装时由系统自动创建并授权）。<b>运行期不支持切换数据目录</b>：如需换到其他卷，请<a>卸载（保留数据）</a>后重装，并在安装向导的「数据目录（可选）」里指定路径。</p>
+desc                       = <p>Mail-archiver 邮件归档与检索服务（中文版）。</p><p>从桌面图标打开即免二次登录：应用通过 fnOS 统一网关读取当前登录用户身份，首次进入时输入一次 Mail-archiver 账户密码完成绑定，之后自动登录。</p><p>数据默认存放在官方共享目录（data-share，安装时由系统自动创建并授权）。<b>运行期不支持切换数据目录</b>：如需换到其他卷，请卸载（保留数据）后重装，并在安装向导的「数据目录（可选）」里指定路径。</p>
 source                     = thirdparty
 platform                   = x86
 maintainer                 = s1t5
@@ -14,5 +14,5 @@ desktop_applaunchname      = mail-archiver-fnos.Application
 checkport                  = false
 disable_authorization_path = true
 os_min_version             = 1.2.0401
-changelog                  = 26.10.01: 正式首发版（版本号规则：上游 26.10.x + 我方发布序号，首发 01）｜应用内「忘记密码」说明改为首选应用设置重置；网关免密认证修复（中间件自取 LISTEN_UNIX_SOCKET 判 0600）；开发者/发布者短名；APPDEST 兜底；pgdata 四态校验；镜像 zh-39f59d2-p30 内嵌
-checksum                   = 407d01a69bc0fba3dff2e0bee0ac5a00
+changelog                  = 26.10.04: 旧 Cookie 过期不再白屏——Consent 校验失败清 Cookie 并 302 登录页(带"会话已过期"提示)，新增 StaleCookieRecoveryMiddleware 全局兜底；deny 分支提示"已忽略授权"；内嵌 postgres 离线；双 pull_policy: never
+checksum                   = 9491b61ecc4af7ab616edce430f95fdf

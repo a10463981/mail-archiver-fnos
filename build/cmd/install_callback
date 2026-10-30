@@ -274,8 +274,9 @@ chmod 600 "${SETTINGS}" 2>/dev/null || true
 # ---------------------------------------------------------------- 镜像准备
 # 策略：包内 tar 优先（离线/慢网/中文镜像），否则走 fnOS 镜像站拉取。
 # 镜像只影响安装期，不参与运行期逻辑；中文版打成 mail-archiver-fnos:zh-<commit> 的 tar 即可。
-IMAGE_REF="$(head -n1 "${APPDEST}/docker/image.ref" 2>/dev/null || echo mail-archiver-fnos:zh-39f59d2-p30)"
-IMAGE_TAR="$(ls "${APPDEST}"/images/*.tar 2>/dev/null | head -n1 || true)"
+IMAGE_REF="$(head -n1 "${APPDEST}/docker/image.ref" 2>/dev/null || echo mail-archiver-fnos:zh-39f59d2-p33)"
+IMAGE_TAR="$(ls "${APPDEST}"/images/*.tar 2>/dev/null | grep -v 'postgres-' | head -n1 || true)"
+PG_TAR="$(ls "${APPDEST}"/images/postgres-*.tar 2>/dev/null | head -n1 || true)"
 
 if docker image inspect "${IMAGE_REF}" >/dev/null 2>&1; then
     say "镜像已存在：${IMAGE_REF}（跳过导入/拉取）"
@@ -296,10 +297,23 @@ else
     fi
 fi
 
-# PostgreSQL 基础镜像：同样先看本地，再走镜像站
+# PostgreSQL 基础镜像：0.1.46/26.10.02 起**内嵌于包内**（完全离线安装）。
+# 顺序：本地已有 → 包内 tar load → 最后才联网拉取（失败即 fail 并给手工指引）。
 if ! docker image inspect postgres:16-alpine >/dev/null 2>&1; then
-    say "拉取 postgres:16-alpine"
-    docker pull postgres:16-alpine >/dev/null 2>&1 || fail "postgres:16-alpine 拉取失败，请检查网络或预置镜像。"
+    if [ -n "${PG_TAR}" ] && [ -f "${PG_TAR}" ]; then
+        say "从包内导入 postgres 镜像：$(basename "${PG_TAR}")"
+        if docker load -i "${PG_TAR}" >/dev/null 2>&1; then
+            say "postgres 镜像导入完成（离线）"
+        else
+            warn "包内 postgres tar 导入失败（${PG_TAR}）"
+        fi
+    else
+        say "包内未发现 postgres tar，改为在线拉取 postgres:16-alpine"
+    fi
+    if ! docker image inspect postgres:16-alpine >/dev/null 2>&1; then
+        docker pull postgres:16-alpine >/dev/null 2>&1 \
+            || fail "postgres:16-alpine 既不在包内也无法拉取。手工导入：docker load -i ${APPDEST}/images/postgres-16-alpine.tar（或任意来源的 postgres:16-alpine tar）。"
+    fi
 fi
 
 # ---------------------------------------------------------------- 渲染到载荷

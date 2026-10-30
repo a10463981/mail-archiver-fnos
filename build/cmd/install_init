@@ -145,35 +145,46 @@ fi
 # 若等到 init-docker 才准备，compose 会尝试 pull 并失败（实测：event=APP_INSTALL_FAILED_INIT_DOCKER_EXCEPTION）。
 # 因此在这里从"包解压目录"里把 images/*.tar 先 load 进本地 docker。
 APP_NAME=mail-archiver-fnos
-IMAGE_REF_DEFAULT="mail-archiver-fnos:zh-39f59d2-p30"
+IMAGE_REF_DEFAULT="mail-archiver-fnos:zh-39f59d2-p33"
 
 preload_image() {
-    tarball=""
+    # 0.1.46/26.10.02：包内可能有两个 tar（应用镜像 + postgres:16-alpine），全部 load
+    local loaded=0 pkgd member
     for d in "${TRIM_TEMP_TPKFILE:-}" "${TRIM_PKGINST_TEMP_DIR:-}" \
              "/vol1/appcenter-downloads/${APP_NAME}-${TRIM_APPVER:-}-tpk"; do
         [ -n "${d}" ] && [ -d "${d}" ] || continue
         say "探测包目录：${d}"
-        found="$(tar tzf "${d}/app.tgz" 2>/dev/null | grep -m1 '^images/.*\.tar$' || true)"
-        if [ -n "${found}" ]; then
-            tarball="${d}/app.tgz:${found}"
-            break
+        pkgd="${d}"
+        break
+    done
+    [ -n "${pkgd:-}" ] || { say "包内未发现镜像 tar（走在线拉取）"; return 0; }
+    members="$(tar tzf "${pkgd}/app.tgz" 2>/dev/null | grep '^images/.*\.tar$' || true)"
+    [ -n "${members}" ] || { say "包内未发现镜像 tar（走在线拉取）"; return 0; }
+    tmpd="$(mktemp -d 2>/dev/null || echo /tmp/mapreload)"
+    mkdir -p "${tmpd}"
+    printf '%s\n' "${members}" | while IFS= read -r member; do
+        [ -n "${member}" ] || continue
+        say "包内镜像：${member}（来自 ${pkgd}）"
+        tar xzf "${pkgd}/app.tgz" -C "${tmpd}" "${member}" 2>/dev/null || { warn "解出镜像 tar 失败（${member}）"; continue; }
+        if [ -f "${tmpd}/${member}" ]; then
+            if docker load -i "${tmpd}/${member}" >/dev/null 2>&1; then
+                say "镜像预载完成：$(basename "${member}")"
+            else
+                warn "docker load 失败（${member}），稍后由 install_callback 重试/在线拉取"
+            fi
+        else
+            warn "解出镜像 tar 失败（${member}）"
         fi
     done
-    [ -n "${tarball}" ] || { say "包内未发现镜像 tar（走在线拉取）"; return 0; }
-
-    pkg="${tarball%%:*}"; mem="${tarball#*:}"
-    say "包内镜像：${mem}（来自 ${pkg}）"
-    tmpd="$(mktemp -d 2>/dev/null || echo /tmp/mapreload)"
-    mkdir -p "${tmpd}" && tar xzf "${pkg}" -C "${tmpd}" "${mem}" 2>/dev/null || true
-    if [ -f "${tmpd}/${mem}" ]; then
-        docker load -i "${tmpd}/${mem}" >/dev/null 2>&1 \
-            && say "镜像预载完成：$(basename "${mem}")" \
-            || warn "docker load 失败（${mem}），稍后由 install_callback 重试/在线拉取"
-        rm -rf "${tmpd}"
-    else
-        warn "解出镜像 tar 失败（${mem}）"
-        rm -rf "${tmpd}"
+    rm -rf "${tmpd}"
+    # postgres 缺失时（旧包无内置 tar）再兜一次：有 tar 就 load，没有就留给 callback 在线拉
+    if ! docker image inspect postgres:16-alpine >/dev/null 2>&1; then
+        if [ -f "${pkgd}/images/postgres-16-alpine.tar" ]; then
+            docker load -i "${pkgd}/images/postgres-16-alpine.tar" >/dev/null 2>&1 \
+                && say "postgres 预载完成" || warn "postgres 预载失败（将由 install_callback 兜底）"
+        fi
     fi
+    return 0
 }
 
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
